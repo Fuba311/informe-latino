@@ -1,17 +1,24 @@
 # -*- coding: utf-8 -*-
 """
-LATAM Territorial Poverty Map — fast, tidy, production-ready Dash app.
+LATAM Territorial Poverty Map — Render-ready Dash app.
 
-Changelog (Aug 2025):
-- Migrated to Maplibre (px.choropleth_map) with graceful fallback to Mapbox.
-- Precomputed feature and country bounding boxes (huge speedup on scope changes).
-- Cached national layers + pre-indexed regional slices.
-- Control panel spacing & dropdown portals; cleaned agricultural labels.
-- Fullscreen map (fills viewport).
+Boot behavior:
+- On startup, downloads (if missing) the two data files from
+  https://github.com/Fuba311/informe-latino (branch MAIN) and saves
+  them next to this app.py. Override via env vars if needed.
 
-Run:
-    pip install pandas numpy plotly dash
-    python app.py
+Env overrides (optional):
+  DATA_REPO=Owner/Repo         (default: Fuba311/informe-latino)
+  DATA_BRANCH=branch_or_tag    (default: main)
+  PANEL_URL=...                (full URL to parquet; overrides repo/branch)
+  GEOJSON_URL=...              (full URL to geojson; overrides repo/branch)
+  DASH_DEBUG=0/1               (default 1 locally; Render sets to 0 typically)
+
+Run locally:
+  pip install -r requirements.txt
+  python app.py
+On Render:
+  start command: gunicorn app:server --workers 2 --threads 8 --timeout 120
 """
 
 import os
@@ -21,32 +28,75 @@ import warnings
 from pathlib import Path
 from functools import lru_cache
 
-try:
-    from dash import Patch
-    HAVE_PATCH = True
-except Exception:
-    HAVE_PATCH = False
+# --- network fetch (Raw GitHub) ------------------------------------------------
+from typing import Tuple, Dict, List
+import requests
 
+def _raw_url(owner_repo: str, branch: str, filename: str) -> str:
+    return f"https://raw.githubusercontent.com/{owner_repo}/{branch}/{filename}"
 
+def download_if_needed(url: str, dest: Path, timeout: int = 60, chunk: int = 1 << 20) -> Path:
+    """Idempotent, streaming download with atomic write."""
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if dest.exists() and dest.stat().st_size > 0:
+        return dest
+    tmp = dest.with_suffix(dest.suffix + ".tmp")
+    with requests.get(url, stream=True, timeout=timeout) as r:
+        r.raise_for_status()
+        with open(tmp, "wb") as f:
+            for part in r.iter_content(chunk_size=chunk):
+                if part:
+                    f.write(part)
+    os.replace(tmp, dest)
+    return dest
+
+# --- scientific stack ----------------------------------------------------------
 import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 
+# --- Dash ----------------------------------------------------------------------
 import dash
 from dash import dcc, html, no_update
 from dash.dependencies import Input, Output, State, MATCH
+try:
+    # Dash >=2.9 has Patch (partial property updates)
+    from dash import Patch
+    HAVE_PATCH = True
+except Exception:
+    HAVE_PATCH = False
 
 print("--- STARTING LATAM POVERTY DASHBOARD ---")
 
 # =============================================================================
-# 1) PATHS & LOADING
+# 1) PATHS & FETCH REMOTE DATA
 # =============================================================================
 BASE_DIR = Path(__file__).parent
-PANEL_PATH = BASE_DIR / "panel_territorial.parquet"
-GEOJSON_PATH = BASE_DIR / "latam_regiones_simplified.geojson"
 
+# Remote repo defaults (can be overridden with env vars)
+DATA_REPO = os.getenv("DATA_REPO", "Fuba311/informe-latino")
+DATA_BRANCH = os.getenv("DATA_BRANCH", "main")
 
+# Filenames we expect in that repo (at root)
+PANEL_FILE = "panel_territorial.parquet"
+GEOJSON_FILE = "latam_regiones_simplified.geojson"
+
+# Allow full-URL overrides
+PANEL_URL = os.getenv("PANEL_URL") or _raw_url(DATA_REPO, DATA_BRANCH, PANEL_FILE)
+GEOJSON_URL = os.getenv("GEOJSON_URL") or _raw_url(DATA_REPO, DATA_BRANCH, GEOJSON_FILE)
+
+PANEL_PATH = BASE_DIR / PANEL_FILE
+GEOJSON_PATH = BASE_DIR / GEOJSON_FILE
+
+# Fetch if missing (Render’s disk is ephemeral, so we download at boot)
+print(f"→ Ensuring data files exist:\n  {PANEL_FILE}\n  {GEOJSON_FILE}")
+download_if_needed(PANEL_URL, PANEL_PATH)
+download_if_needed(GEOJSON_URL, GEOJSON_PATH)
+
+# =============================================================================
+# 2) LOADING & PRECOMPUTATIONS
+# =============================================================================
 required_cols = {
     "country_code", "country_name", "periodo",
     "region_code", "region_name", "feature_id",
@@ -83,11 +133,11 @@ for c in cat_cols:
 with open(GEOJSON_PATH, "r", encoding="utf-8") as f:
     GEOJSON_ALL = json.load(f)
 
-FEATURES = GEOJSON_ALL.get("features", [])
-FEATURE_BY_ID = {feat.get("properties", {}).get("id"): feat for feat in FEATURES}
+FEATURES: List[dict] = GEOJSON_ALL.get("features", [])
+FEATURE_BY_ID: Dict[str, dict] = {feat.get("properties", {}).get("id"): feat for feat in FEATURES}
 
 # Map ISO3 -> set(feature_ids) for quick per-country subset
-COUNTRY_FEATURE_IDS = {}
+COUNTRY_FEATURE_IDS: Dict[str, set] = {}
 for feat in FEATURES:
     fid = feat.get("properties", {}).get("id")
     if not fid or "|" not in fid:
@@ -95,8 +145,8 @@ for feat in FEATURES:
     iso3 = fid.split("|", 1)[0]
     COUNTRY_FEATURE_IDS.setdefault(iso3, set()).add(fid)
 
-# ---- Precompute bounding boxes once (massive perf gain on scope switches)
-def _compute_bbox_from_geometry(geom) -> tuple[float, float, float, float]:
+# ---- Precompute bounding boxes (massive perf gain on scope switches)
+def _compute_bbox_from_geometry(geom) -> Tuple[float, float, float, float]:
     """Return (lonW, latS, lonE, latN)."""
     lons, lats = [], []
 
@@ -104,8 +154,7 @@ def _compute_bbox_from_geometry(geom) -> tuple[float, float, float, float]:
         if not isinstance(arr, (list, tuple)):
             return
         if arr and isinstance(arr[0], (float, int)) and len(arr) == 2:
-            lons.append(float(arr[0]))
-            lats.append(float(arr[1]))
+            lons.append(float(arr[0])); lats.append(float(arr[1]))
         else:
             for a in arr:
                 crawl(a)
@@ -116,7 +165,7 @@ def _compute_bbox_from_geometry(geom) -> tuple[float, float, float, float]:
         return (-90.0, -56.0, -30.0, 15.0)  # broad LATAM default
     return (min(lons), min(lats), max(lons), max(lats))
 
-BBOX_BY_ID: dict[str, tuple[float, float, float, float]] = {}
+BBOX_BY_ID: Dict[str, Tuple[float, float, float, float]] = {}
 for fid, feat in FEATURE_BY_ID.items():
     bbox = feat.get("bbox")
     if bbox and len(bbox) == 4:
@@ -126,7 +175,7 @@ for fid, feat in FEATURE_BY_ID.items():
     BBOX_BY_ID[fid] = (float(lonW), float(latS), float(lonE), float(latN))
 
 # Aggregate per country
-COUNTRY_BBOX: dict[str, tuple[float, float, float, float]] = {}
+COUNTRY_BBOX: Dict[str, Tuple[float, float, float, float]] = {}
 for iso3, fids in COUNTRY_FEATURE_IDS.items():
     boxes = [BBOX_BY_ID[f] for f in fids if f in BBOX_BY_ID]
     if boxes:
@@ -137,7 +186,7 @@ for iso3, fids in COUNTRY_FEATURE_IDS.items():
         COUNTRY_BBOX[iso3] = (lonW, latS, lonE, latN)
 
 # =============================================================================
-# 2) UI OPTIONS
+# 3) UI OPTIONS
 # =============================================================================
 # Indicators
 ind_map = (panel[["indicator_label", "indicator_col"]]
@@ -165,9 +214,7 @@ COUNTRY_NAME_BY_CODE = dict(zip(countries["country_code"], countries["country_na
 def _clean_agri_label(s: str) -> str:
     if not isinstance(s, str):
         return s
-    # Drop " (hog_...)" or similar codes
     s = re.sub(r"\s*\([^)]+\)\s*$", "", s).strip()
-    # Shorten a bit
     s = s.replace("Algún", "Algún").replace("agricultura", "agricultura").replace("autoempleado", "autoempleado")
     return s
 
@@ -176,25 +223,20 @@ agri_defs_raw = (panel.loc[panel["agri_def"].ne("N/A"), "agri_def"]
 AGRI_OPTIONS = [{"label": _clean_agri_label(x), "value": x} for x in agri_defs_raw] if agri_defs_raw else []
 
 # =============================================================================
-# 3) SMALL HELPERS (speed + clarity)
+# 4) SMALL HELPERS
 # =============================================================================
-
 def _subset_ui_text(subset_key: str, agri_def: str) -> str:
-    """Human string for title/hover ('' if population total)."""
     if subset_key == "Todos":
         return ""
     if "Agrícola" in subset_key and agri_def and agri_def != "N/A":
         return f"{subset_key} — {_clean_agri_label(agri_def)}"
     return subset_key
 
-
 def resolve_subset(filtros, agri_def_label):
-    """Return (subset_key, agri_def) given checklist selections."""
     filtros = filtros or []
     rural = "RURAL" in filtros
     indig = "INDIGENA" in filtros
     agri  = "AGRI" in filtros
-
     if not agri:
         if rural and not indig:   return "Rural", "N/A"
         if indig and not rural:   return "Indígena", "N/A"
@@ -208,7 +250,6 @@ def resolve_subset(filtros, agri_def_label):
         return "Agrícola", agdef
 
 def _robust_min_max(series: pd.Series):
-    """Winsorized range to avoid tiny degenerate color scales."""
     s = pd.to_numeric(series, errors="coerce")
     s = s[np.isfinite(s)]
     if s.empty:
@@ -228,7 +269,6 @@ def _center_zoom_from_bbox(lonW, latS, lonE, latN):
     return center, zoom
 
 def _bbox_from_features(selected_feature_ids):
-    """Compute center/zoom hint from precomputed feature bboxes."""
     if not selected_feature_ids:
         return {"lat": -15.0, "lon": -60.0}, 3.0
     boxes = [BBOX_BY_ID.get(fid) for fid in selected_feature_ids if fid in BBOX_BY_ID]
@@ -240,29 +280,23 @@ def _bbox_from_features(selected_feature_ids):
 
 @lru_cache(maxsize=256)
 def _subset_geojson_cached(ids_tuple: tuple):
-    """Return a tiny GeoJSON with only the requested features (cached)."""
     feats = [FEATURE_BY_ID[i] for i in ids_tuple if i in FEATURE_BY_ID]
     return {"type": "FeatureCollection", "features": feats}
 
 def _feature_ids_for_scope(df_map: pd.DataFrame, escala: str, pais_iso3: str | None):
-    """Select which polygons to include in the map."""
     if escala == "PAIS" and pais_iso3:
         return sorted(list(COUNTRY_FEATURE_IDS.get(pais_iso3, set())))
-    # Else: only include what is actually present in the data slice
     return sorted(df_map["feature_id"].dropna().astype(str).unique().tolist())
 
 # =============================================================================
-# 3.1) Preindexed slices & cached national layers
+# 4.1) Preindexed slices & cached national layers
 # =============================================================================
-# Regional rows only (region_code > 0)
 _panel_reg = panel[panel["region_code"].astype("int64") > 0]
-# Build index of row indices per (periodo, subset_key, agri_def, indicator_col)
-REG_INDEX: dict[tuple, np.ndarray] = {}
+REG_INDEX: Dict[tuple, np.ndarray] = {}
 for key, df_g in _panel_reg.groupby(["periodo", "subset_key", "agri_def", "indicator_col"], observed=True):
     REG_INDEX[key] = df_g.index.values.astype(np.int64)
 
-# Region skeleton by period (to replicate national values fast)
-REGIONS_BY_PERIOD: dict[str, pd.DataFrame] = {}
+REGIONS_BY_PERIOD: Dict[str, pd.DataFrame] = {}
 for per, df_g in _panel_reg.groupby("periodo", observed=True):
     REGIONS_BY_PERIOD[str(per)] = df_g[[
         "country_code", "country_name", "region_code", "region_name", "feature_id"
@@ -270,7 +304,6 @@ for per, df_g in _panel_reg.groupby("periodo", observed=True):
 
 @lru_cache(maxsize=2048)
 def _regional_slice(periodo_sel: str, subset_key: str, agri_def: str, indicator_col: str):
-    """Return a *copy* of the regional slice for the combination (cached indices)."""
     key = (periodo_sel, subset_key, agri_def, indicator_col)
     idx = REG_INDEX.get(key)
     if idx is None or len(idx) == 0:
@@ -279,9 +312,6 @@ def _regional_slice(periodo_sel: str, subset_key: str, agri_def: str, indicator_
 
 @lru_cache(maxsize=2048)
 def _national_layer_all_countries(periodo_sel: str, subset_key: str, agri_def: str, indicator_col: str):
-    """
-    Construct regional-level rows carrying national values per country (cached).
-    """
     nat = panel[
         (panel["periodo"] == periodo_sel) &
         (panel["subset_key"] == subset_key) &
@@ -291,7 +321,7 @@ def _national_layer_all_countries(periodo_sel: str, subset_key: str, agri_def: s
     ][["country_code", "indicator_label", "value_pct", "se_pp", "ci95_lo", "ci95_hi", "sample_n"]].copy()
 
     if nat.empty:
-        return nat  # empty
+        return nat
 
     regions = REGIONS_BY_PERIOD.get(str(periodo_sel))
     if regions is None or regions.empty:
@@ -319,7 +349,7 @@ def build_national_layer(periodo_sel, subset_key, agri_def, indicator_col, count
     return df
 
 # =============================================================================
-# 4) APP INIT & CSS
+# 5) APP INIT & CSS
 # =============================================================================
 app = dash.Dash(__name__, title="Mapa de Pobreza Territorial LATAM")
 
@@ -327,10 +357,21 @@ from flask import send_from_directory
 
 @app.server.route("/geo/latam_regiones_simplified.geojson")
 def _serve_geojson():
-    return send_from_directory(str(BASE_DIR), "latam_regiones_simplified.geojson")
+    return send_from_directory(str(BASE_DIR), GEOJSON_FILE)
 
+GRAPH_CONFIG = {
+    "scrollZoom": True,
+    "displaylogo": False,
+    "modeBarButtonsToRemove": [
+        "lasso2d", "select2d", "autoScale2d", "toggleSpikelines",
+        "hoverClosestCartesian", "hoverCompareCartesian"
+    ],
+    "toImageButtonOptions": {"format": "png", "scale": 2},
+}
 
-# Minimal embedded CSS (INCATA-like look) with bigger controls and portals
+MAP_STYLE = "carto-positron"  # works with MapLibre and Mapbox fallback
+
+# Minimal embedded CSS
 app.index_string = """
 <!DOCTYPE html>
 <html>
@@ -379,7 +420,7 @@ app.index_string = """
       .controls-content > div { margin-bottom: 16px; }
       .controls-content label { display:block; font-weight:700; font-size:14px; margin-bottom:6px; }
       .lifted-dropdown .Select-menu-outer, .lifted-dropdown .Select__menu{
-        z-index:3000 !important;  /* ensure menus render above panel */
+        z-index:3000 !important;
       }
       .title-wrap{
         position:absolute; top:14px; left:50%; transform:translateX(-50%);
@@ -396,15 +437,12 @@ app.index_string = """
         .floating-controls{ top:56px; left:6px; width:86vw; }
         .floating-controls.icon-only{ width:44px; }
       }
-      .hero{ margin-bottom:28px; } 
+      .hero{ margin-bottom:28px; }
       .hero h1{ text-align:center; color:var(--brand); margin:8px 0 6px; font-size:28px; line-height:1.15;}
       .hero p { text-align:center; margin:0; font-size:16px; line-height:1.35;}
-      .hero{ margin-bottom:28px; } 
       /* Fullscreen graph height */
       #map-container { height: calc(100vh - 150px); width: 100%; }
-      .controls-content{
-        padding-bottom: 280px;   /* adjust 220–320px to taste */
-      }
+      .controls-content{ padding-bottom: 280px; }
     </style>
   </head>
   <body>
@@ -420,21 +458,8 @@ app.index_string = """
 
 server = app.server
 
-GRAPH_CONFIG = {
-    "scrollZoom": True,
-    "displaylogo": False,
-    "modeBarButtonsToRemove": [
-        "lasso2d", "select2d", "autoScale2d", "toggleSpikelines",
-        "hoverClosestCartesian", "hoverCompareCartesian"
-    ],
-    "toImageButtonOptions": {"format": "png", "scale": 2},
-}
-
-# Map style (works for Maplibre and Mapbox fallback)
-MAP_STYLE = "carto-positron"
-
 # =============================================================================
-# 5) LAYOUT
+# 6) LAYOUT
 # =============================================================================
 def _period_marks():
     return {PERIOD_TO_IDX[p]: p for p in PERIODOS}
@@ -442,7 +467,6 @@ def _period_marks():
 app.layout = html.Div(
     style={"padding": "10px"},
     children=[
-        # Hero
         html.Div(
             className="hero",
             children=[
@@ -451,8 +475,6 @@ app.layout = html.Div(
                 html.P("Activa 'Escala por país' para identificar hotspots dentro de un país.", className="muted"),
             ],
         ),
-
-        # Card
         html.Div(
             className="section-card",
             children=[
@@ -460,7 +482,6 @@ app.layout = html.Div(
                     id="map-container",
                     style={"position": "relative", "width": "100%", "overflow": "visible"},
                     children=[
-                        # Floating controls
                         html.Div(
                             id={"type": "floating-panel-wrapper", "index": "map"},
                             className="floating-controls",
@@ -479,7 +500,6 @@ app.layout = html.Div(
                                     id={"type": "panel-content", "index": "map"},
                                     className="controls-content",
                                     children=[
-                                        # Indicador + Periodo
                                         html.Div([
                                             html.Label("📊 Variable de pobreza"),
                                             dcc.Dropdown(
@@ -490,7 +510,6 @@ app.layout = html.Div(
                                                 clearable=False,
                                             ),
                                         ]),
-
                                         html.Div([
                                             html.Label("📅 Periodo"),
                                             dcc.Slider(
@@ -502,8 +521,6 @@ app.layout = html.Div(
                                                 updatemode="mouseup",
                                             ),
                                         ]),
-
-                                        # Filtros
                                         html.Div([
                                             html.Label("🎯 Filtros de población"),
                                             dcc.Checklist(
@@ -526,8 +543,6 @@ app.layout = html.Div(
                                                 placeholder="Definición de 'agrícola'",
                                             ),
                                         ]),
-
-                                        # Nivel y Escala
                                         html.Div([
                                             html.Label("🏷️ Nivel / Escala"),
                                             dcc.RadioItems(
@@ -563,8 +578,6 @@ app.layout = html.Div(
                                 ),
                             ],
                         ),
-
-                        # Title + spinner
                         html.Div(
                             className="title-wrap",
                             children=[
@@ -579,8 +592,6 @@ app.layout = html.Div(
                                 ),
                             ],
                         ),
-
-                        # Map
                         dcc.Graph(
                             id="mapa",
                             style={"height": "100%", "width": "100%"},
@@ -594,7 +605,7 @@ app.layout = html.Div(
 )
 
 # =============================================================================
-# 6) CALLBACKS — PANEL BEHAVIOR
+# 7) CONTROLS CALLBACKS
 # =============================================================================
 @app.callback(
     [Output({"type": "floating-panel-wrapper", "index": MATCH}, "className"),
@@ -611,26 +622,19 @@ def toggle_panel_animation(n, current_class):
             return "floating-controls icon-only", "controls-content hidden"
     return no_update, no_update
 
-@app.callback(
-    Output("dd-agri-def", "disabled"),
-    Input("chk-filtros", "value")
-)
+@app.callback(Output("dd-agri-def", "disabled"), Input("chk-filtros", "value"))
 def toggle_agri_def(filtros):
     filtros = filtros or []
     return ("AGRI" not in filtros) or (len(AGRI_OPTIONS) == 0)
 
-@app.callback(
-    Output("dd-pais", "disabled"),
-    Input("radio-escala", "value")
-)
+@app.callback(Output("dd-pais", "disabled"), Input("radio-escala", "value"))
 def toggle_country_dropdown(modo):
     return (modo != "PAIS")
 
 # =============================================================================
-# 7) MAP BUILDER (Maplibre-first with Mapbox fallback)
+# 8) MAP BUILDERS (MapLibre-first with Mapbox fallback)
 # =============================================================================
 def _make_choropleth(df_map, zmin, zmax, center, zoom, indicador_label):
-    """Prefer px.choropleth_map (Maplibre). Fallback to mapbox if not available."""
     kwargs_common = dict(
         geojson=GEOJSON_ALL,
         locations="feature_id",
@@ -643,17 +647,16 @@ def _make_choropleth(df_map, zmin, zmax, center, zoom, indicador_label):
         opacity=0.92,
         hover_name="region_name",
     )
-
-    # Try Maplibre
     try:
+        # Plotly >=5.24 (MapLibre)
         fig = px.choropleth_map(
             df_map,
-            map_style=MAP_STYLE,  # Maplibre arg
+            map_style=MAP_STYLE,
             **kwargs_common
         )
         return fig
     except Exception:
-        # Fall back to Mapbox quietly; suppress deprecation warnings
+        # Fallback to Mapbox traces if MapLibre API not present
         warnings.filterwarnings("ignore", message=".*choropleth_mapbox.*", category=DeprecationWarning)
         fig = px.choropleth_mapbox(
             df_map,
@@ -663,7 +666,7 @@ def _make_choropleth(df_map, zmin, zmax, center, zoom, indicador_label):
         return fig
 
 # =============================================================================
-# 8) CALLBACK — MAP
+# 9) MAP CALLBACK
 # =============================================================================
 @app.callback(
     [Output("mapa", "figure"),
@@ -681,7 +684,6 @@ def _make_choropleth(df_map, zmin, zmax, center, zoom, indicador_label):
     [State("mapa", "relayoutData"), State("mapa", "figure")]
 )
 def update_map(indicador_label, periodo_idx, filtros, agri_def_label, nivel, escala, pais_iso3, relayout_data, prev_fig):
-    # Validate minimal inputs
     if not indicador_label or not periodo_idx:
         return go.Figure(), "Selecciona una variable y un periodo", ""
 
@@ -689,7 +691,7 @@ def update_map(indicador_label, periodo_idx, filtros, agri_def_label, nivel, esc
     periodo_sel = IDX_TO_PERIOD.get(periodo_idx, PERIODOS[-1])
     subset_key, agri_def = resolve_subset(filtros, agri_def_label)
 
-    # Build data slice (fast paths using cache/index)
+    # Build data slice
     if nivel == "NAT":
         df_map = build_national_layer(periodo_sel, subset_key, agri_def, indicador_col,
                                       country_filter=pais_iso3 if escala == "PAIS" else None)
@@ -708,44 +710,27 @@ def update_map(indicador_label, periodo_idx, filtros, agri_def_label, nivel, esc
     # Color scale (robust)
     zmin, zmax = _robust_min_max(df_map["value_pct"])
 
-    # GeoJSON subset (global vs país)
+    # GeoJSON subset & order
     feature_ids = _feature_ids_for_scope(df_map, escala, pais_iso3)
-
-    # Ensure df_map rows follow the same order as feature_ids
     if feature_ids:
-        df_map = (
-            df_map.set_index("feature_id")
-                .reindex(feature_ids)
-                .reset_index()
-        )
+        df_map = df_map.set_index("feature_id").reindex(feature_ids).reset_index()
 
-
-    # Center/zoom heuristic — use precomputed country bbox when possible
+    # Center/zoom heuristic
     if escala == "PAIS" and pais_iso3 and pais_iso3 in COUNTRY_BBOX:
         center, zoom = _center_zoom_from_bbox(*COUNTRY_BBOX[pais_iso3])
     else:
         center, zoom = _bbox_from_features(feature_ids)
 
-    # Preserve user pan/zoom across updates
-    if relayout_data and "mapbox.center" in relayout_data:
-        zoom = relayout_data.get("mapbox.zoom", zoom)
-        center = relayout_data.get("mapbox.center", center)
-    if relayout_data and "maplibre.center" in relayout_data:
-        zoom = relayout_data.get("maplibre.zoom", zoom)
-        center = relayout_data.get("maplibre.center", center)
+    # Preserve user pan/zoom across updates (MapLibre uses layout.map.*, Mapbox uses layout.mapbox.*)
+    if relayout_data:
+        if "map.center" in relayout_data:
+            zoom = relayout_data.get("map.zoom", zoom)
+            center = relayout_data.get("map.center", center)
+        elif "mapbox.center" in relayout_data:
+            zoom = relayout_data.get("mapbox.zoom", zoom)
+            center = relayout_data.get("mapbox.center", center)
 
-    # Hover customdata (float32)
-    customdata = np.stack([
-        df_map["country_name"].astype(str).values,
-        df_map["region_name"].astype(str).values,
-        df_map["ci95_lo"].astype(np.float32).values,
-        df_map["ci95_hi"].astype(np.float32).values,
-        df_map["se_pp"].astype(np.float32).values,
-        df_map["sample_n"].astype(np.float32).values,
-    ], axis=-1)
-
-        # ---------- Build arrays and dynamic hover ----------
-    # lists (not numpy) -> lighter JSON and patches cleanly
+    # Build arrays and dynamic hover (lists → lighter JSON; play nice with Patch)
     z = df_map["value_pct"].astype(np.float32).tolist()
     customdata = np.stack([
         df_map["country_name"].astype(str).values,
@@ -757,9 +742,7 @@ def update_map(indicador_label, periodo_idx, filtros, agri_def_label, nivel, esc
     ], axis=-1).tolist()
 
     subpop_txt = _subset_ui_text(subset_key, agri_def)
-    hover_lines = [
-        "<b>%{customdata[0]}</b> – %{customdata[1]}<br>",
-    ]
+    hover_lines = ["<b>%{customdata[0]}</b> – %{customdata[1]}<br>"]
     if subpop_txt:
         hover_lines.append(f"<i>Subpoblación: {subpop_txt}</i><br>")
     hover_lines += [
@@ -770,7 +753,7 @@ def update_map(indicador_label, periodo_idx, filtros, agri_def_label, nivel, esc
     ]
     hovertemplate = "".join(hover_lines) + "<extra></extra>"
 
-    # ---------- If polygons didn't change, PATCH instead of rebuild ----------
+    # Patch fast path if polygons didn't change
     same_scope = False
     if isinstance(prev_fig, dict) and prev_fig.get("data"):
         prev_locs = prev_fig["data"][0].get("locations")
@@ -780,7 +763,7 @@ def update_map(indicador_label, periodo_idx, filtros, agri_def_label, nivel, esc
         patch = Patch()
         patch["data"][0]["z"] = z
         patch["data"][0]["customdata"] = customdata
-        patch["data"][0]["hovertemplate"] = hovertemplate  # <<< ensure hover text updates instantly
+        patch["data"][0]["hovertemplate"] = hovertemplate
         patch["layout"]["coloraxis"]["cmin"] = zmin
         patch["layout"]["coloraxis"]["cmax"] = zmax
 
@@ -791,30 +774,25 @@ def update_map(indicador_label, periodo_idx, filtros, agri_def_label, nivel, esc
             map_title += f" · Subpoblación: {subpop_txt}"
         return patch, map_title, ""
 
-    # ---------- Full rebuild (first load or scope changed) ----------
+    # Full rebuild
     fig = _make_choropleth(df_map, zmin, zmax, center, zoom, indicador_label)
-
-    # Apply hover/customdata to whatever trace type was created (Maplibre or Mapbox)
     fig.update_traces(hovertemplate=hovertemplate, customdata=customdata)
 
-    # Title
     nivel_txt = "Nacional" if nivel == "NAT" else "Regional"
     scope_title = COUNTRY_NAME_BY_CODE.get(pais_iso3, "América Latina") if (escala == "PAIS" and pais_iso3) else "América Latina"
     map_title = f"{indicador_label} · {nivel_txt} · {scope_title} · Periodo {periodo_sel}"
     if subpop_txt:
         map_title += f" · Subpoblación: {subpop_txt}"
 
-
     fig.update_layout(
         margin=dict(l=0, r=0, t=0, b=0),
         coloraxis_colorbar=dict(title="%"),
-        uirevision="keep",  # preserve user pan/zoom across updates
+        uirevision="keep",
     )
     return fig, map_title, ""
 
-
 # =============================================================================
-# 9) RUN
+# 10) RUN
 # =============================================================================
 if __name__ == "__main__":
     is_render = bool(os.getenv("RENDER") or os.getenv("PORT"))
