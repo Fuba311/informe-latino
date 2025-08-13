@@ -5,3 +5,4 @@ numpy
 pyarrow
 gunicorn
 requests
+flask_compress
