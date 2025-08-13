@@ -1,46 +1,104 @@
 # -*- coding: utf-8 -*-
 """
-LATAM Territorial Poverty Map — Render-ready Dash app.
+LATAM Territorial Poverty Map — Dash app (partition-aware, Render-ready).
 
-Boot behavior:
-- On startup, downloads (if missing) the two data files from
-  https://github.com/Fuba311/informe-latino (branch MAIN) and saves
-  them next to this app.py. Override via env vars if needed.
+It will look for your preprocessed outputs as follows:
 
-Env overrides (optional):
-  DATA_REPO=Owner/Repo         (default: Fuba311/informe-latino)
-  DATA_BRANCH=branch_or_tag    (default: main)
-  PANEL_URL=...                (full URL to parquet; overrides repo/branch)
-  GEOJSON_URL=...              (full URL to geojson; overrides repo/branch)
-  DASH_DEBUG=0/1               (default 1 locally; Render sets to 0 typically)
+1) Prefer a local Hive-partitioned dataset written by your script:
+     - ./panel_territorial_ds/
+     - OR any ./panel_territorial_ds_* (timestamped) folder (chooses the best)
+   (These match how your pre-process saves partitions: periodo=/country_code=/)
 
-Run locally:
+2) If no dataset dir is found:
+     - Use a monolithic ./panel_territorial.parquet (if present)
+     - Otherwise, download files from GitHub raw (configurable)
+     - Or download and unzip a dataset ZIP if DATASET_ZIP_URL is provided.
+
+Env vars (all optional):
+  DATASET_DIR        Absolute or relative path to a dataset directory
+  DATASET_ZIP_URL    HTTPS URL to a ZIP that contains panel_territorial_ds/...
+  DATA_REPO          default: Fuba311/informe-latino
+  DATA_BRANCH        default: main
+  PANEL_URL          direct URL to panel_territorial.parquet
+  GEOJSON_URL        direct URL to latam_regiones_simplified.geojson
+  MAP_STYLE          default: carto-positron
+  DASH_DEBUG         0/1 (default 1 locally)
+
+Run:
   pip install -r requirements.txt
   python app.py
 On Render:
-  start command: gunicorn app:server --workers 2 --threads 8 --timeout 120
+  gunicorn app:server --workers 2 --threads 8 --timeout 120
 """
 
 import os
 import re
+import io
 import json
+import zipfile
 import warnings
 from pathlib import Path
 from functools import lru_cache
+from typing import Tuple, Dict, List, Optional
 
-# --- network fetch (Raw GitHub) ------------------------------------------------
-from typing import Tuple, Dict, List
 import requests
+import numpy as np
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+
+import dash
+from dash import dcc, html, no_update
+from dash.dependencies import Input, Output, State, MATCH
+try:
+    from dash import Patch
+    HAVE_PATCH = True
+except Exception:
+    HAVE_PATCH = False
+
+# Attempt pyarrow.dataset for fast partitioned reads
+try:
+    import pyarrow.dataset as ds
+    HAVE_DATASET = True
+except Exception:
+    ds = None  # type: ignore
+    HAVE_DATASET = False
+import re
+CLEAN_PARENS_RE = re.compile(r"\s*\([^)]+\)\s*$")
+
+
+print("--- STARTING LATAM POVERTY DASHBOARD ---")
+
+# =============================================================================
+# 1) PATHS / FETCH HELPERS
+# =============================================================================
+BASE_DIR = Path(__file__).parent.resolve()
+
+DATA_REPO = os.getenv("DATA_REPO", "Fuba311/informe-latino")
+DATA_BRANCH = os.getenv("DATA_BRANCH", "main")
+
+PANEL_FILE = "panel_territorial.parquet"
+GEOJSON_FILE = "latam_regiones_simplified.geojson"
+DATASET_DIR_NAME = "panel_territorial_ds"
 
 def _raw_url(owner_repo: str, branch: str, filename: str) -> str:
     return f"https://raw.githubusercontent.com/{owner_repo}/{branch}/{filename}"
 
-def download_if_needed(url: str, dest: Path, timeout: int = 60, chunk: int = 1 << 20) -> Path:
-    """Idempotent, streaming download with atomic write."""
+PANEL_URL = os.getenv("PANEL_URL") or _raw_url(DATA_REPO, DATA_BRANCH, PANEL_FILE)
+GEOJSON_URL = os.getenv("GEOJSON_URL") or _raw_url(DATA_REPO, DATA_BRANCH, GEOJSON_FILE)
+DATASET_ZIP_URL = os.getenv("DATASET_ZIP_URL")  # optional
+DATASET_DIR_ENV = os.getenv("DATASET_DIR")      # optional
+
+PANEL_PATH = BASE_DIR / PANEL_FILE
+GEOJSON_PATH = BASE_DIR / GEOJSON_FILE
+
+def download_if_needed(url: str, dest: Path, timeout: int = 180, chunk: int = 1 << 20) -> Path:
+    """Idempotent streaming download with atomic write."""
     dest.parent.mkdir(parents=True, exist_ok=True)
     if dest.exists() and dest.stat().st_size > 0:
         return dest
     tmp = dest.with_suffix(dest.suffix + ".tmp")
+    print(f"↓ Downloading {url} → {dest.name}")
     with requests.get(url, stream=True, timeout=timeout) as r:
         r.raise_for_status()
         with open(tmp, "wb") as f:
@@ -50,93 +108,106 @@ def download_if_needed(url: str, dest: Path, timeout: int = 60, chunk: int = 1 <
     os.replace(tmp, dest)
     return dest
 
-# --- scientific stack ----------------------------------------------------------
-import numpy as np
-import pandas as pd
-import plotly.express as px
-import plotly.graph_objects as go
+def maybe_download_and_unzip_dataset(zip_url: str, out_dir: Path) -> None:
+    """Download a dataset ZIP and unzip into out_dir (idempotent)."""
+    if out_dir.exists() and any(out_dir.rglob("*.parquet")):
+        return
+    out_dir.mkdir(parents=True, exist_ok=True)
+    print(f"↓ Downloading dataset ZIP from {zip_url}")
+    with requests.get(zip_url, stream=True, timeout=600) as r:
+        r.raise_for_status()
+        buf = io.BytesIO()
+        for chunk in r.iter_content(chunk_size=1 << 20):
+            if chunk:
+                buf.write(chunk)
+        buf.seek(0)
+    with zipfile.ZipFile(buf) as zf:
+        names = zf.namelist()
+        root_prefix = DATASET_DIR_NAME + "/"
+        if any(n.startswith(root_prefix) for n in names):
+            # Strip the root prefix to land exactly at out_dir/
+            for n in names:
+                if n.endswith("/") or not n.startswith(root_prefix):
+                    continue
+                rel = Path(n[len(root_prefix):])
+                target = out_dir / rel
+                target.parent.mkdir(parents=True, exist_ok=True)
+                with zf.open(n) as src, open(target, "wb") as dst:
+                    dst.write(src.read())
+        else:
+            zf.extractall(out_dir)
+    print(f"✓ Unzipped dataset into {out_dir}")
 
-# --- Dash ----------------------------------------------------------------------
-import dash
-from dash import dcc, html, no_update
-from dash.dependencies import Input, Output, State, MATCH
+def discover_dataset_dir(base_dir: Path) -> Optional[Path]:
+    """Find a dataset directory matching your pre-process naming:
+       - panel_territorial_ds/
+       - panel_territorial_ds_YYYYmmdd_HHMMSS/
+       Prefer exact name; else choose the one with most parquet files.
+    """
+    # 1) If env var points somewhere valid, use it
+    if DATASET_DIR_ENV:
+        p = Path(DATASET_DIR_ENV)
+        if not p.is_absolute():
+            p = base_dir / p
+        if p.exists() and any(p.rglob("*.parquet")):
+            print(f"✓ Using dataset from DATASET_DIR={p}")
+            return p
+
+    # 2) Exact name in base dir
+    exact = base_dir / DATASET_DIR_NAME
+    if exact.exists() and any(exact.rglob("*.parquet")):
+        return exact
+
+    # 3) Any timestamped siblings
+    candidates = []
+    for d in base_dir.glob(DATASET_DIR_NAME + "*"):
+        if d.is_dir() and any(d.rglob("*.parquet")):
+            # Score by number of parquet files and mtime
+            try:
+                nfiles = sum(1 for _ in d.rglob("*.parquet"))
+            except Exception:
+                nfiles = 0
+            mtime = d.stat().st_mtime
+            candidates.append((nfiles, mtime, d))
+    if candidates:
+        candidates.sort(reverse=True)  # most files, then newest
+        best = candidates[0][2]
+        print(f"✓ Using discovered dataset dir: {best}")
+        return best
+
+    return None
+
+# Optionally download and unzip dataset into the canonical folder
+dataset_dir = BASE_DIR / DATASET_DIR_NAME
+if DATASET_ZIP_URL:
+    try:
+        maybe_download_and_unzip_dataset(DATASET_ZIP_URL, dataset_dir)
+    except Exception as e:
+        print(f"⚠ Failed to download/unzip dataset ZIP: {e}")
+
+# Always ensure GeoJSON exists (small)
 try:
-    # Dash >=2.9 has Patch (partial property updates)
-    from dash import Patch
-    HAVE_PATCH = True
-except Exception:
-    HAVE_PATCH = False
+    download_if_needed(GEOJSON_URL, GEOJSON_PATH)
+except Exception as e:
+    print(f"⚠ GeoJSON download failed: {e}")
 
-print("--- STARTING LATAM POVERTY DASHBOARD ---")
-
-# =============================================================================
-# 1) PATHS & FETCH REMOTE DATA
-# =============================================================================
-BASE_DIR = Path(__file__).parent
-
-# Remote repo defaults (can be overridden with env vars)
-DATA_REPO = os.getenv("DATA_REPO", "Fuba311/informe-latino")
-DATA_BRANCH = os.getenv("DATA_BRANCH", "main")
-
-# Filenames we expect in that repo (at root)
-PANEL_FILE = "panel_territorial.parquet"
-GEOJSON_FILE = "latam_regiones_simplified.geojson"
-
-# Allow full-URL overrides
-PANEL_URL = os.getenv("PANEL_URL") or _raw_url(DATA_REPO, DATA_BRANCH, PANEL_FILE)
-GEOJSON_URL = os.getenv("GEOJSON_URL") or _raw_url(DATA_REPO, DATA_BRANCH, GEOJSON_FILE)
-
-PANEL_PATH = BASE_DIR / PANEL_FILE
-GEOJSON_PATH = BASE_DIR / GEOJSON_FILE
-
-# Fetch if missing (Render’s disk is ephemeral, so we download at boot)
-print(f"→ Ensuring data files exist:\n  {PANEL_FILE}\n  {GEOJSON_FILE}")
-download_if_needed(PANEL_URL, PANEL_PATH)
-download_if_needed(GEOJSON_URL, GEOJSON_PATH)
+# If neither dataset nor parquet exists, try to fetch parquet
+DISCOVERED_DATASET_DIR = discover_dataset_dir(BASE_DIR)
+if DISCOVERED_DATASET_DIR is None and not (BASE_DIR / PANEL_FILE).exists():
+    try:
+        download_if_needed(PANEL_URL, PANEL_PATH)
+    except Exception as e:
+        print(f"⚠ Parquet download failed: {e}")
 
 # =============================================================================
-# 2) LOADING & PRECOMPUTATIONS
+# 2) LOAD GEOJSON & PRECOMPUTE BBOX
 # =============================================================================
-required_cols = {
-    "country_code", "country_name", "periodo",
-    "region_code", "region_name", "feature_id",
-    "subset_key", "agri_def",
-    "indicator_label", "indicator_col",
-    "value_pct", "se_pp", "ci95_lo", "ci95_hi", "sample_n"
-}
-
-# ---- Load panel
-panel = pd.read_parquet(PANEL_PATH)
-panel["feature_id"] = panel["feature_id"].astype(str)
-
-missing = required_cols - set(panel.columns)
-if missing:
-    raise ValueError(f"Faltan columnas en el Parquet: {missing}")
-
-# Keep only what we need (smaller DataFrame → faster serialization)
-panel = panel[list(required_cols)].copy()
-
-# Dtypes for speed/memory
-for c in ["value_pct", "se_pp", "ci95_lo", "ci95_hi"]:
-    panel[c] = pd.to_numeric(panel[c], errors="coerce").astype("float32")
-panel["sample_n"] = pd.to_numeric(panel["sample_n"], errors="coerce").astype("float32")
-
-cat_cols = [
-    "country_code", "country_name", "subset_key", "agri_def",
-    "indicator_label", "indicator_col", "region_name", "periodo"
-]
-for c in cat_cols:
-    if panel[c].dtype != "category":
-        panel[c] = panel[c].astype("category")
-
-# ---- Load GeoJSON
 with open(GEOJSON_PATH, "r", encoding="utf-8") as f:
     GEOJSON_ALL = json.load(f)
 
 FEATURES: List[dict] = GEOJSON_ALL.get("features", [])
 FEATURE_BY_ID: Dict[str, dict] = {feat.get("properties", {}).get("id"): feat for feat in FEATURES}
 
-# Map ISO3 -> set(feature_ids) for quick per-country subset
 COUNTRY_FEATURE_IDS: Dict[str, set] = {}
 for feat in FEATURES:
     fid = feat.get("properties", {}).get("id")
@@ -145,24 +216,18 @@ for feat in FEATURES:
     iso3 = fid.split("|", 1)[0]
     COUNTRY_FEATURE_IDS.setdefault(iso3, set()).add(fid)
 
-# ---- Precompute bounding boxes (massive perf gain on scope switches)
 def _compute_bbox_from_geometry(geom) -> Tuple[float, float, float, float]:
-    """Return (lonW, latS, lonE, latN)."""
     lons, lats = [], []
-
     def crawl(arr):
-        if not isinstance(arr, (list, tuple)):
-            return
+        if not isinstance(arr, (list, tuple)): return
         if arr and isinstance(arr[0], (float, int)) and len(arr) == 2:
             lons.append(float(arr[0])); lats.append(float(arr[1]))
         else:
-            for a in arr:
-                crawl(a)
-
+            for a in arr: crawl(a)
     coords = (geom or {}).get("coordinates", [])
     crawl(coords)
     if not lons or not lats:
-        return (-90.0, -56.0, -30.0, 15.0)  # broad LATAM default
+        return (-90.0, -56.0, -30.0, 15.0)
     return (min(lons), min(lats), max(lons), max(lats))
 
 BBOX_BY_ID: Dict[str, Tuple[float, float, float, float]] = {}
@@ -174,7 +239,6 @@ for fid, feat in FEATURE_BY_ID.items():
         lonW, latS, lonE, latN = _compute_bbox_from_geometry(feat.get("geometry"))
     BBOX_BY_ID[fid] = (float(lonW), float(latS), float(lonE), float(latN))
 
-# Aggregate per country
 COUNTRY_BBOX: Dict[str, Tuple[float, float, float, float]] = {}
 for iso3, fids in COUNTRY_FEATURE_IDS.items():
     boxes = [BBOX_BY_ID[f] for f in fids if f in BBOX_BY_ID]
@@ -186,51 +250,233 @@ for iso3, fids in COUNTRY_FEATURE_IDS.items():
         COUNTRY_BBOX[iso3] = (lonW, latS, lonE, latN)
 
 # =============================================================================
-# 3) UI OPTIONS
+# 3) DATA BACKEND (partitioned fast path; monolithic fallback)
 # =============================================================================
-# Indicators
-ind_map = (panel[["indicator_label", "indicator_col"]]
-           .drop_duplicates()
-           .sort_values("indicator_label"))
-INDICATOR_OPTIONS = [{"label": lbl, "value": lbl} for lbl in ind_map["indicator_label"].tolist()]
-INDICATOR_TO_COL = dict(zip(ind_map["indicator_label"], ind_map["indicator_col"]))
+USE_DATASET = HAVE_DATASET and (DISCOVERED_DATASET_DIR is not None)
 
-# Periods (ordered if categorical)
-if pd.api.types.is_categorical_dtype(panel["periodo"]) and panel["periodo"].cat.ordered:
-    PERIODOS = panel["periodo"].cat.categories.tolist()
+# Columns used in scans
+BASE_COLS = [
+    "country_code","country_name","periodo",
+    "region_code","region_name","feature_id",
+    "subset_key","agri_def",
+    "indicator_label","indicator_col",
+    "value_pct","se_pp","ci95_lo","ci95_hi","sample_n",
+]
+
+if USE_DATASET:
+    DS = ds.dataset(str(DISCOVERED_DATASET_DIR), format="parquet", partitioning="hive")
+    print(f"ℹ Using partitioned dataset at {DISCOVERED_DATASET_DIR}")
+
+    def _scan(cols: List[str], filt=None) -> pd.DataFrame:
+        sc = DS.scanner(columns=cols, filter=filt)
+        tbl = sc.to_table()
+        df = tbl.to_pandas(types_mapper=pd.ArrowDtype)
+        # Normalize dtypes
+        for c in ("value_pct","se_pp","ci95_lo","ci95_hi","sample_n"):
+            if c in df.columns:
+                df[c] = pd.to_numeric(df[c], errors="coerce").astype("float32")
+        for c in ("country_code","country_name","periodo","subset_key","agri_def",
+                  "indicator_label","indicator_col","region_name","feature_id"):
+            if c in df.columns:
+                df[c] = df[c].astype("string")
+        if "region_code" in df.columns:
+            df["region_code"] = pd.to_numeric(df["region_code"], errors="coerce").astype("Int64")
+        return df
+
+    # Enumerations (cached)
+    @lru_cache(maxsize=1)
+    def _periods() -> List[str]:
+        df = _scan(["periodo"])
+        cats = sorted(df["periodo"].dropna().astype(str).unique().tolist())
+        pref = ["2015-2016","2017-2018","2019","2020-2021","2022-2023"]
+        return [p for p in pref if p in cats] + [p for p in cats if p not in pref]
+
+    PERIODOS = _periods()
+    PERIOD_TO_IDX = {p: i for i, p in enumerate(PERIODOS, start=1)}
+    IDX_TO_PERIOD = {i: p for p, i in PERIOD_TO_IDX.items()}
+
+    @lru_cache(maxsize=1)
+    def _indicators():
+        df = _scan(["indicator_label","indicator_col"]).drop_duplicates()
+        df = df.sort_values("indicator_label")
+        options = [{"label": r["indicator_label"], "value": r["indicator_label"]} for _, r in df.iterrows()]
+        mapping = dict(zip(df["indicator_label"], df["indicator_col"]))
+        return options, mapping
+
+    INDICATOR_OPTIONS, INDICATOR_TO_COL = _indicators()
+
+    @lru_cache(maxsize=1)
+    def _countries():
+        df = _scan(["country_code","country_name"]).drop_duplicates()
+        df = df.sort_values("country_name")
+        options = [{"label": n, "value": c} for c, n in zip(df["country_code"], df["country_name"])]
+        name_by_code = dict(zip(df["country_code"], df["country_name"]))
+        return options, name_by_code
+
+    COUNTRY_OPTIONS, COUNTRY_NAME_BY_CODE = _countries()
+
+    @lru_cache(maxsize=1)
+    def _agri_options():
+        df = _scan(["agri_def"]).dropna().drop_duplicates()
+        df = df[df["agri_def"].astype(str) != "N/A"]
+        vals = sorted(df["agri_def"].astype(str).tolist())
+        def _clean(s: str) -> str:
+            s = re.sub(r"\s*\([^)]+\)\s*$", "", s).strip()
+            return s.replace("Algún","Algún").replace("agricultura","agricultura").replace("autoempleado","autoempleado")
+        return [{"label": _clean(v), "value": v} for v in vals]
+    AGRI_OPTIONS = _agri_options()
+
+    @lru_cache(maxsize=16)
+    def _regions_skeleton(periodo_sel: str) -> pd.DataFrame:
+        f = (ds.field("periodo") == periodo_sel) & (ds.field("region_code") > 0)
+        cols = ["country_code","country_name","region_code","region_name","feature_id"]
+        return _scan(cols, f).drop_duplicates()
+
+    @lru_cache(maxsize=512)
+    def _regional_slice(periodo_sel: str, subset_key: str, agri_def: str, indicator_col: str,
+                        country_filter: Optional[str]) -> pd.DataFrame:
+        f = (
+            (ds.field("periodo") == periodo_sel) &
+            (ds.field("subset_key") == subset_key) &
+            (ds.field("agri_def") == agri_def) &
+            (ds.field("indicator_col") == indicator_col) &
+            (ds.field("region_code") > 0)
+        )
+        if country_filter:
+            f = f & (ds.field("country_code") == country_filter)
+        return _scan(BASE_COLS, f)
+
+    @lru_cache(maxsize=512)
+    def _national_layer_all_countries(periodo_sel: str, subset_key: str, agri_def: str, indicator_col: str,
+                                      country_filter: Optional[str]) -> pd.DataFrame:
+        f = (
+            (ds.field("periodo") == periodo_sel) &
+            (ds.field("subset_key") == subset_key) &
+            (ds.field("agri_def") == agri_def) &
+            (ds.field("indicator_col") == indicator_col) &
+            (ds.field("region_code") == 0)
+        )
+        nat = _scan(["country_code","indicator_label","value_pct","se_pp","ci95_lo","ci95_hi","sample_n"], f)
+        if nat.empty:
+            return nat
+        regions = _regions_skeleton(periodo_sel).copy()
+        if country_filter:
+            regions = regions[regions["country_code"] == country_filter]
+        for c in ["value_pct","se_pp","ci95_lo","ci95_hi","sample_n"]:
+            regions[c] = regions["country_code"].map(dict(zip(nat["country_code"], nat[c]))).astype("float32")
+        regions["indicator_col"] = indicator_col
+        regions["indicator_label"] = nat["indicator_label"].iloc[0]
+        regions["subset_key"] = subset_key
+        regions["agri_def"] = agri_def
+        regions["periodo"] = periodo_sel
+        return regions
+
+    def build_national_layer(periodo_sel, subset_key, agri_def, indicator_col, country_filter=None):
+        return _national_layer_all_countries(periodo_sel, subset_key, agri_def, indicator_col, country_filter)
+
 else:
-    PERIODOS = sorted(panel["periodo"].astype(str).unique().tolist())
-PERIOD_TO_IDX = {p: i for i, p in enumerate(PERIODOS, start=1)}
-IDX_TO_PERIOD = {i: p for p, i in PERIOD_TO_IDX.items()}
+    # -------------------- Monolithic fallback --------------------
+    print("ℹ Using monolithic Parquet (no dataset dir found).")
+    if not PANEL_PATH.exists():
+        raise FileNotFoundError(f"Missing {PANEL_PATH}. Provide DATASET_ZIP_URL or PANEL_URL or commit the file.")
+    panel = pd.read_parquet(PANEL_PATH)
 
-# Countries
-countries = (panel[["country_code", "country_name"]]
-             .drop_duplicates()
-             .sort_values("country_name"))
-COUNTRY_OPTIONS = [{"label": n, "value": c} for c, n in zip(countries["country_code"], countries["country_name"])]
-COUNTRY_NAME_BY_CODE = dict(zip(countries["country_code"], countries["country_name"]))
+    panel["feature_id"] = panel["feature_id"].astype(str)
+    for c in ["value_pct", "se_pp", "ci95_lo", "ci95_hi"]:
+        panel[c] = pd.to_numeric(panel[c], errors="coerce").astype("float32")
+    panel["sample_n"] = pd.to_numeric(panel["sample_n"], errors="coerce").astype("float32")
 
-# Agricultural definitions present (clean labels; remove variable codes in parentheses)
-def _clean_agri_label(s: str) -> str:
-    if not isinstance(s, str):
-        return s
-    s = re.sub(r"\s*\([^)]+\)\s*$", "", s).strip()
-    s = s.replace("Algún", "Algún").replace("agricultura", "agricultura").replace("autoempleado", "autoempleado")
-    return s
+    ind_map = (panel[["indicator_label", "indicator_col"]]
+               .drop_duplicates()
+               .sort_values("indicator_label"))
+    INDICATOR_OPTIONS = [{"label": lbl, "value": lbl} for lbl in ind_map["indicator_label"].tolist()]
+    INDICATOR_TO_COL = dict(zip(ind_map["indicator_label"], ind_map["indicator_col"]))
 
-agri_defs_raw = (panel.loc[panel["agri_def"].ne("N/A"), "agri_def"]
-                 .dropna().drop_duplicates().sort_values().astype(str).tolist())
-AGRI_OPTIONS = [{"label": _clean_agri_label(x), "value": x} for x in agri_defs_raw] if agri_defs_raw else []
+    if pd.api.types.is_categorical_dtype(panel["periodo"]) and panel["periodo"].cat.ordered:
+        PERIODOS = panel["periodo"].cat.categories.tolist()
+    else:
+        PERIODOS = sorted(panel["periodo"].astype(str).unique().tolist())
+    PERIOD_TO_IDX = {p: i for i, p in enumerate(PERIODOS, start=1)}
+    IDX_TO_PERIOD = {i: p for p, i in PERIOD_TO_IDX.items()}
+
+    countries = (panel[["country_code", "country_name"]]
+                 .drop_duplicates()
+                 .sort_values("country_name"))
+    COUNTRY_OPTIONS = [{"label": n, "value": c} for c, n in zip(countries["country_code"], countries["country_name"])]
+    COUNTRY_NAME_BY_CODE = dict(zip(countries["country_code"], countries["country_name"]))
+
+    def _clean_agri_label(s: str) -> str:
+        if not isinstance(s, str): return s
+        s = re.sub(r"\s*\([^)]+\)\s*$", "", s).strip()
+        return s.replace("Algún","Algún").replace("agricultura","agricultura").replace("autoempleado","autoempleado")
+    agri_defs_raw = (panel.loc[panel["agri_def"].ne("N/A"), "agri_def"]
+                     .dropna().drop_duplicates().sort_values().astype(str).tolist())
+    AGRI_OPTIONS = [{"label": _clean_agri_label(x), "value": x} for x in agri_defs_raw] if agri_defs_raw else []
+
+    _panel_reg = panel[panel["region_code"].astype("int64") > 0]
+    REG_INDEX: Dict[tuple, np.ndarray] = {}
+    for key, df_g in _panel_reg.groupby(["periodo", "subset_key", "agri_def", "indicator_col"], observed=True):
+        REG_INDEX[key] = df_g.index.values.astype(np.int64)
+
+    REGIONS_BY_PERIOD: Dict[str, pd.DataFrame] = {}
+    for per, df_g in _panel_reg.groupby("periodo", observed=True):
+        REGIONS_BY_PERIOD[str(per)] = df_g[[
+            "country_code","country_name","region_code","region_name","feature_id"
+        ]].drop_duplicates().copy()
+
+    @lru_cache(maxsize=2048)
+    def _regional_slice(periodo_sel: str, subset_key: str, agri_def: str, indicator_col: str,
+                        country_filter: Optional[str]) -> pd.DataFrame:
+        idx = REG_INDEX.get((periodo_sel, subset_key, agri_def, indicator_col))
+        if idx is None or len(idx) == 0:
+            return pd.DataFrame(columns=list(panel.columns))
+        df = panel.loc[idx].copy()
+        if country_filter:
+            df = df[df["country_code"] == country_filter]
+        return df
+
+    @lru_cache(maxsize=2048)
+    def _national_layer_all_countries(periodo_sel: str, subset_key: str, agri_def: str, indicator_col: str,
+                                      country_filter: Optional[str]) -> pd.DataFrame:
+        nat = panel[
+            (panel["periodo"] == periodo_sel) &
+            (panel["subset_key"] == subset_key) &
+            (panel["agri_def"] == agri_def) &
+            (panel["indicator_col"] == indicator_col) &
+            (panel["region_code"].astype("int64") == 0)
+        ][["country_code","indicator_label","value_pct","se_pp","ci95_lo","ci95_hi","sample_n"]].copy()
+        if nat.empty:
+            return nat
+        regions = REGIONS_BY_PERIOD.get(str(periodo_sel))
+        if regions is None or regions.empty:
+            return pd.DataFrame(columns=list(panel.columns))
+        regions = regions.copy()
+        for c in ["value_pct","se_pp","ci95_lo","ci95_hi","sample_n"]:
+            mapping = dict(zip(nat["country_code"], nat[c]))
+            regions[c] = regions["country_code"].map(mapping).astype("float32")
+        regions["indicator_col"] = indicator_col
+        regions["indicator_label"] = nat["indicator_label"].iloc[0]
+        regions["subset_key"] = subset_key
+        regions["agri_def"] = agri_def
+        regions["periodo"] = periodo_sel
+        if country_filter:
+            regions = regions[regions["country_code"] == country_filter]
+        return regions
+
+    def build_national_layer(periodo_sel, subset_key, agri_def, indicator_col, country_filter=None):
+        return _national_layer_all_countries(periodo_sel, subset_key, agri_def, indicator_col, country_filter)
 
 # =============================================================================
-# 4) SMALL HELPERS
+# 4) SHARED HELPERS
 # =============================================================================
 def _subset_ui_text(subset_key: str, agri_def: str) -> str:
     if subset_key == "Todos":
         return ""
     if "Agrícola" in subset_key and agri_def and agri_def != "N/A":
-        return f"{subset_key} — {_clean_agri_label(agri_def)}"
+        clean_agri = CLEAN_PARENS_RE.sub("", str(agri_def)).strip()
+        return f"{subset_key} — {clean_agri}"
     return subset_key
+
 
 def resolve_subset(filtros, agri_def_label):
     filtros = filtros or []
@@ -278,83 +524,18 @@ def _bbox_from_features(selected_feature_ids):
     lonE = max(b[2] for b in boxes); latN = max(b[3] for b in boxes)
     return _center_zoom_from_bbox(lonW, latS, lonE, latN)
 
-@lru_cache(maxsize=256)
-def _subset_geojson_cached(ids_tuple: tuple):
-    feats = [FEATURE_BY_ID[i] for i in ids_tuple if i in FEATURE_BY_ID]
-    return {"type": "FeatureCollection", "features": feats}
-
-def _feature_ids_for_scope(df_map: pd.DataFrame, escala: str, pais_iso3: str | None):
+def _feature_ids_for_scope(df_map: pd.DataFrame, escala: str, pais_iso3: Optional[str]):
     if escala == "PAIS" and pais_iso3:
         return sorted(list(COUNTRY_FEATURE_IDS.get(pais_iso3, set())))
     return sorted(df_map["feature_id"].dropna().astype(str).unique().tolist())
 
 # =============================================================================
-# 4.1) Preindexed slices & cached national layers
-# =============================================================================
-_panel_reg = panel[panel["region_code"].astype("int64") > 0]
-REG_INDEX: Dict[tuple, np.ndarray] = {}
-for key, df_g in _panel_reg.groupby(["periodo", "subset_key", "agri_def", "indicator_col"], observed=True):
-    REG_INDEX[key] = df_g.index.values.astype(np.int64)
-
-REGIONS_BY_PERIOD: Dict[str, pd.DataFrame] = {}
-for per, df_g in _panel_reg.groupby("periodo", observed=True):
-    REGIONS_BY_PERIOD[str(per)] = df_g[[
-        "country_code", "country_name", "region_code", "region_name", "feature_id"
-    ]].drop_duplicates().copy()
-
-@lru_cache(maxsize=2048)
-def _regional_slice(periodo_sel: str, subset_key: str, agri_def: str, indicator_col: str):
-    key = (periodo_sel, subset_key, agri_def, indicator_col)
-    idx = REG_INDEX.get(key)
-    if idx is None or len(idx) == 0:
-        return pd.DataFrame(columns=list(panel.columns))
-    return panel.loc[idx].copy()
-
-@lru_cache(maxsize=2048)
-def _national_layer_all_countries(periodo_sel: str, subset_key: str, agri_def: str, indicator_col: str):
-    nat = panel[
-        (panel["periodo"] == periodo_sel) &
-        (panel["subset_key"] == subset_key) &
-        (panel["agri_def"] == agri_def) &
-        (panel["indicator_col"] == indicator_col) &
-        (panel["region_code"].astype("int64") == 0)
-    ][["country_code", "indicator_label", "value_pct", "se_pp", "ci95_lo", "ci95_hi", "sample_n"]].copy()
-
-    if nat.empty:
-        return nat
-
-    regions = REGIONS_BY_PERIOD.get(str(periodo_sel))
-    if regions is None or regions.empty:
-        return pd.DataFrame(columns=list(panel.columns))
-
-    regions = regions.copy()
-    cols = ["value_pct", "se_pp", "ci95_lo", "ci95_hi", "sample_n"]
-    for c in cols:
-        mapping = dict(zip(nat["country_code"], nat[c]))
-        regions[c] = regions["country_code"].map(mapping).astype("float32")
-
-    regions["indicator_col"] = indicator_col
-    regions["indicator_label"] = nat["indicator_label"].iloc[0]
-    regions["subset_key"] = subset_key
-    regions["agri_def"] = agri_def
-    regions["periodo"] = periodo_sel
-    return regions
-
-def build_national_layer(periodo_sel, subset_key, agri_def, indicator_col, country_filter=None):
-    df = _national_layer_all_countries(periodo_sel, subset_key, agri_def, indicator_col)
-    if df is None or df.empty:
-        return df
-    if country_filter:
-        df = df[df["country_code"] == country_filter]
-    return df
-
-# =============================================================================
 # 5) APP INIT & CSS
 # =============================================================================
 app = dash.Dash(__name__, title="Mapa de Pobreza Territorial LATAM")
+server = app.server
 
 from flask import send_from_directory
-
 @app.server.route("/geo/latam_regiones_simplified.geojson")
 def _serve_geojson():
     return send_from_directory(str(BASE_DIR), GEOJSON_FILE)
@@ -363,15 +544,16 @@ GRAPH_CONFIG = {
     "scrollZoom": True,
     "displaylogo": False,
     "modeBarButtonsToRemove": [
-        "lasso2d", "select2d", "autoScale2d", "toggleSpikelines",
-        "hoverClosestCartesian", "hoverCompareCartesian"
+        "lasso2d","select2d","autoScale2d","toggleSpikelines",
+        "hoverClosestCartesian","hoverCompareCartesian"
     ],
     "toImageButtonOptions": {"format": "png", "scale": 2},
 }
+MAP_STYLE = os.getenv("MAP_STYLE", "carto-positron")
 
-MAP_STYLE = "carto-positron"  # works with MapLibre and Mapbox fallback
+def _period_marks():
+    return { (idx := PERIOD_TO_IDX[p]): p for p in PERIODOS }
 
-# Minimal embedded CSS
 app.index_string = """
 <!DOCTYPE html>
 <html>
@@ -387,50 +569,30 @@ app.index_string = """
         --panel-bg:#fff; --panel-header:#e9f5ff;
       }
       html, body { height: 100%; }
-      body{
-        font-family:"Segoe UI","Roboto",Arial,sans-serif;
-        background:#f8f9fa; margin:0;
-      }
+      body{ font-family:"Segoe UI","Roboto",Arial,sans-serif; background:#f8f9fa; margin:0; }
       .muted{color:var(--muted);}
-      .section-card{
-        background:var(--card); border:1px solid var(--border); border-radius:12px;
-        padding:12px 12px; box-shadow:var(--shadow); margin:12px auto;
-        max-width: 100%; overflow: visible;
-      }
-      .floating-controls{
-        position:absolute; top:16px; left:8px; width:360px; background:var(--panel-bg);
+      .section-card{ background:var(--card); border:1px solid var(--border); border-radius:12px;
+        padding:12px 12px; box-shadow:var(--shadow); margin:12px auto; max-width: 100%; overflow: visible; }
+      .floating-controls{ position:absolute; top:16px; left:8px; width:360px; background:var(--panel-bg);
         border:1px solid #e9ecef; border-radius:12px; box-shadow:var(--shadow);
-        overflow:visible !important; z-index:2000; transition:width .2s ease;
-      }
+        overflow:visible !important; z-index:2000; transition:width .2s ease; }
       .floating-controls.icon-only{ width:46px; overflow:hidden !important; }
-      .control-panel-header{
-        display:flex; align-items:center; gap:10px; padding:12px 14px;
-        background:var(--panel-header); border-bottom:1px solid #d6ebff; cursor:pointer;
-      }
+      .control-panel-header{ display:flex; align-items:center; gap:10px; padding:12px 14px;
+        background:var(--panel-header); border-bottom:1px solid #d6ebff; cursor:pointer; }
       .control-panel-header .header-icon{font-size:18px;}
       .control-panel-header .header-text{font-weight:700;color:var(--brand);font-size:15px;}
-      .toggle-btn{
-        margin-left:auto; border:1px solid var(--brand); background:var(--brand-soft);
-        color:var(--brand); border-radius:8px; font-size:12px; padding:4px 10px; cursor:pointer;
-      }
-      .controls-content{
-        padding:14px; max-height:74vh; overflow-y:auto;
-      }
+      .toggle-btn{ margin-left:auto; border:1px solid var(--brand); background:var(--brand-soft);
+        color:var(--brand); border-radius:8px; font-size:12px; padding:4px 10px; cursor:pointer; }
+      .controls-content{ padding:14px; max-height:74vh; overflow-y:auto; }
       .controls-content.hidden{display:none;}
       .controls-content > div { margin-bottom: 16px; }
       .controls-content label { display:block; font-weight:700; font-size:14px; margin-bottom:6px; }
-      .lifted-dropdown .Select-menu-outer, .lifted-dropdown .Select__menu{
-        z-index:3000 !important;
-      }
-      .title-wrap{
-        position:absolute; top:14px; left:50%; transform:translateX(-50%);
-        z-index:1200; text-align:center; pointer-events:none;
-      }
-      .title-chip{
-        background:rgba(255,255,255,.95); padding:8px 20px; border-radius:20px;
+      .lifted-dropdown .Select-menu-outer, .lifted-dropdown .Select__menu{ z-index:3000 !important; }
+      .title-wrap{ position:absolute; top:14px; left:50%; transform:translateX(-50%);
+        z-index:1200; text-align:center; pointer-events:none; }
+      .title-chip{ background:rgba(255,255,255,.95); padding:8px 20px; border-radius:20px;
         font-size:14px; font-weight:700; color:#004085; box-shadow:0 2px 8px rgba(0,0,0,.12);
-        border:1px solid rgba(0,64,133,.2); display:inline-block;
-      }
+        border:1px solid rgba(0,64,133,.2); display:inline-block; }
       .title-spinner{ margin-top: 10px; }
       .title-spinner .dash-spinner{ transform:scale(.8); opacity:.85; }
       @media (max-width:900px){
@@ -440,7 +602,6 @@ app.index_string = """
       .hero{ margin-bottom:28px; }
       .hero h1{ text-align:center; color:var(--brand); margin:8px 0 6px; font-size:28px; line-height:1.15;}
       .hero p { text-align:center; margin:0; font-size:16px; line-height:1.35;}
-      /* Fullscreen graph height */
       #map-container { height: calc(100vh - 150px); width: 100%; }
       .controls-content{ padding-bottom: 280px; }
     </style>
@@ -455,14 +616,6 @@ app.index_string = """
   </body>
 </html>
 """
-
-server = app.server
-
-# =============================================================================
-# 6) LAYOUT
-# =============================================================================
-def _period_marks():
-    return {PERIOD_TO_IDX[p]: p for p in PERIODOS}
 
 app.layout = html.Div(
     style={"padding": "10px"},
@@ -536,10 +689,10 @@ app.layout = html.Div(
                                             dcc.Dropdown(
                                                 id="dd-agri-def",
                                                 className="lifted-dropdown",
-                                                options=AGRI_OPTIONS,
-                                                value=AGRI_OPTIONS[0]["value"] if AGRI_OPTIONS else None,
+                                                options=(AGRI_OPTIONS or []),
+                                                value=(AGRI_OPTIONS[0]["value"] if AGRI_OPTIONS else None) if AGRI_OPTIONS else None,
                                                 clearable=False,
-                                                disabled=True,
+                                                disabled=(len(AGRI_OPTIONS) == 0),
                                                 placeholder="Definición de 'agrícola'",
                                             ),
                                         ]),
@@ -605,7 +758,7 @@ app.layout = html.Div(
 )
 
 # =============================================================================
-# 7) CONTROLS CALLBACKS
+# 6) CONTROLS CALLBACKS
 # =============================================================================
 @app.callback(
     [Output({"type": "floating-panel-wrapper", "index": MATCH}, "className"),
@@ -625,14 +778,14 @@ def toggle_panel_animation(n, current_class):
 @app.callback(Output("dd-agri-def", "disabled"), Input("chk-filtros", "value"))
 def toggle_agri_def(filtros):
     filtros = filtros or []
-    return ("AGRI" not in filtros) or (len(AGRI_OPTIONS) == 0)
+    return ("AGRI" not in filtros) or (not AGRI_OPTIONS)
 
 @app.callback(Output("dd-pais", "disabled"), Input("radio-escala", "value"))
 def toggle_country_dropdown(modo):
     return (modo != "PAIS")
 
 # =============================================================================
-# 8) MAP BUILDERS (MapLibre-first with Mapbox fallback)
+# 7) MAP BUILDERS
 # =============================================================================
 def _make_choropleth(df_map, zmin, zmax, center, zoom, indicador_label):
     kwargs_common = dict(
@@ -648,7 +801,7 @@ def _make_choropleth(df_map, zmin, zmax, center, zoom, indicador_label):
         hover_name="region_name",
     )
     try:
-        # Plotly >=5.24 (MapLibre)
+        # Plotly >= 5.24: MapLibre
         fig = px.choropleth_map(
             df_map,
             map_style=MAP_STYLE,
@@ -656,7 +809,6 @@ def _make_choropleth(df_map, zmin, zmax, center, zoom, indicador_label):
         )
         return fig
     except Exception:
-        # Fallback to Mapbox traces if MapLibre API not present
         warnings.filterwarnings("ignore", message=".*choropleth_mapbox.*", category=DeprecationWarning)
         fig = px.choropleth_mapbox(
             df_map,
@@ -666,7 +818,7 @@ def _make_choropleth(df_map, zmin, zmax, center, zoom, indicador_label):
         return fig
 
 # =============================================================================
-# 9) MAP CALLBACK
+# 8) MAP CALLBACK
 # =============================================================================
 @app.callback(
     [Output("mapa", "figure"),
@@ -691,14 +843,13 @@ def update_map(indicador_label, periodo_idx, filtros, agri_def_label, nivel, esc
     periodo_sel = IDX_TO_PERIOD.get(periodo_idx, PERIODOS[-1])
     subset_key, agri_def = resolve_subset(filtros, agri_def_label)
 
-    # Build data slice
+    # Data slice
     if nivel == "NAT":
         df_map = build_national_layer(periodo_sel, subset_key, agri_def, indicador_col,
                                       country_filter=pais_iso3 if escala == "PAIS" else None)
     else:
-        df_map = _regional_slice(periodo_sel, subset_key, agri_def, indicador_col)
-        if escala == "PAIS" and pais_iso3 and not df_map.empty:
-            df_map = df_map[df_map["country_code"] == pais_iso3]
+        df_map = _regional_slice(periodo_sel, subset_key, agri_def, indicador_col,
+                                 country_filter=pais_iso3 if (escala == "PAIS" and pais_iso3) else None)
 
     if df_map is None or df_map.empty:
         fig = go.Figure()
@@ -707,30 +858,32 @@ def update_map(indicador_label, periodo_idx, filtros, agri_def_label, nivel, esc
         fig.update_layout(margin=dict(l=0, r=0, t=0, b=0))
         return fig, f"{indicador_label} · {('Nacional' if nivel=='NAT' else 'Regional')} · {periodo_sel}", ""
 
-    # Color scale (robust)
+    # Color scale
     zmin, zmax = _robust_min_max(df_map["value_pct"])
 
-    # GeoJSON subset & order
+    # Feature subset & row order
     feature_ids = _feature_ids_for_scope(df_map, escala, pais_iso3)
     if feature_ids:
         df_map = df_map.set_index("feature_id").reindex(feature_ids).reset_index()
 
-    # Center/zoom heuristic
+    # Center/zoom
     if escala == "PAIS" and pais_iso3 and pais_iso3 in COUNTRY_BBOX:
         center, zoom = _center_zoom_from_bbox(*COUNTRY_BBOX[pais_iso3])
     else:
         center, zoom = _bbox_from_features(feature_ids)
 
-    # Preserve user pan/zoom across updates (MapLibre uses layout.map.*, Mapbox uses layout.mapbox.*)
-    if relayout_data:
-        if "map.center" in relayout_data:
-            zoom = relayout_data.get("map.zoom", zoom)
-            center = relayout_data.get("map.center", center)
-        elif "mapbox.center" in relayout_data:
-            zoom = relayout_data.get("mapbox.zoom", zoom)
-            center = relayout_data.get("mapbox.center", center)
+    # Preserve user pan/zoom (MapLibre & Mapbox)
+    if relayout_data and "mapbox.center" in relayout_data:
+        zoom = relayout_data.get("mapbox.zoom", zoom)
+        center = relayout_data.get("mapbox.center", center)
+    if relayout_data and "maplibre.center" in relayout_data:
+        zoom = relayout_data.get("maplibre.zoom", zoom)
+        center = relayout_data.get("maplibre.center", center)
+    if relayout_data and "map.center" in relayout_data:
+        zoom = relayout_data.get("map.zoom", zoom)
+        center = relayout_data.get("map.center", center)
 
-    # Build arrays and dynamic hover (lists → lighter JSON; play nice with Patch)
+    # Hover/customdata
     z = df_map["value_pct"].astype(np.float32).tolist()
     customdata = np.stack([
         df_map["country_name"].astype(str).values,
@@ -753,7 +906,7 @@ def update_map(indicador_label, periodo_idx, filtros, agri_def_label, nivel, esc
     ]
     hovertemplate = "".join(hover_lines) + "<extra></extra>"
 
-    # Patch fast path if polygons didn't change
+    # Patch fast path
     same_scope = False
     if isinstance(prev_fig, dict) and prev_fig.get("data"):
         prev_locs = prev_fig["data"][0].get("locations")
@@ -792,7 +945,7 @@ def update_map(indicador_label, periodo_idx, filtros, agri_def_label, nivel, esc
     return fig, map_title, ""
 
 # =============================================================================
-# 10) RUN
+# 9) RUN
 # =============================================================================
 if __name__ == "__main__":
     is_render = bool(os.getenv("RENDER") or os.getenv("PORT"))
