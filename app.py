@@ -332,7 +332,7 @@ if USE_DATASET:
         cols = ["country_code","country_name","region_code","region_name","feature_id"]
         return _scan(cols, f).drop_duplicates()
 
-    @lru_cache(maxsize=512)
+    @lru_cache(maxsize=128)
     def _regional_slice(periodo_sel: str, subset_key: str, agri_def: str, indicator_col: str,
                         country_filter: Optional[str]) -> pd.DataFrame:
         f = (
@@ -346,7 +346,7 @@ if USE_DATASET:
             f = f & (ds.field("country_code") == country_filter)
         return _scan(BASE_COLS, f)
 
-    @lru_cache(maxsize=512)
+    @lru_cache(maxsize=128)
     def _national_layer_all_countries(periodo_sel: str, subset_key: str, agri_def: str, indicator_col: str,
                                       country_filter: Optional[str]) -> pd.DataFrame:
         f = (
@@ -424,7 +424,7 @@ else:
             "country_code","country_name","region_code","region_name","feature_id"
         ]].drop_duplicates().copy()
 
-    @lru_cache(maxsize=2048)
+    @lru_cache(maxsize=128)
     def _regional_slice(periodo_sel: str, subset_key: str, agri_def: str, indicator_col: str,
                         country_filter: Optional[str]) -> pd.DataFrame:
         idx = REG_INDEX.get((periodo_sel, subset_key, agri_def, indicator_col))
@@ -435,7 +435,7 @@ else:
             df = df[df["country_code"] == country_filter]
         return df
 
-    @lru_cache(maxsize=2048)
+    @lru_cache(maxsize=128)
     def _national_layer_all_countries(periodo_sel: str, subset_key: str, agri_def: str, indicator_col: str,
                                       country_filter: Optional[str]) -> pd.DataFrame:
         nat = panel[
@@ -535,10 +535,21 @@ def _feature_ids_for_scope(df_map: pd.DataFrame, escala: str, pais_iso3: Optiona
 app = dash.Dash(__name__, title="Mapa de Pobreza Territorial LATAM")
 server = app.server
 
-from flask import send_from_directory
-@app.server.route("/geo/latam_regiones_simplified.geojson")
+# --- add near Dash init ---
+from flask_compress import Compress
+from flask import make_response, send_from_directory
+
+Compress(app.server)  # gzip/brotli if client supports it
+
+GEOJSON_ROUTE = "/latam_regiones_simplified.geojson"
+
+@app.server.route(GEOJSON_ROUTE)
 def _serve_geojson():
-    return send_from_directory(str(BASE_DIR), GEOJSON_FILE)
+    resp = make_response(send_from_directory(str(BASE_DIR), GEOJSON_FILE))
+    # cache hard for a year – Render free dyno restarts won't matter for a static asset
+    resp.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+    return resp
+
 
 GRAPH_CONFIG = {
     "scrollZoom": True,
@@ -784,12 +795,18 @@ def toggle_agri_def(filtros):
 def toggle_country_dropdown(modo):
     return (modo != "PAIS")
 
+
 # =============================================================================
 # 7) MAP BUILDERS
 # =============================================================================
-def _make_choropleth(df_map, zmin, zmax, center, zoom, indicador_label):
+# 7) MAP BUILDERS
+def _make_choropleth(df_map, zmin, zmax, center, zoom, indicador_label, geojson_url=None):
+    # Use your Flask route if nothing is passed in
+    if geojson_url is None:
+        geojson_url = GEOJSON_ROUTE
+
     kwargs_common = dict(
-        geojson=GEOJSON_ALL,
+        geojson=geojson_url,               # URL (fetched once & cached)
         locations="feature_id",
         featureidkey="properties.id",
         color="value_pct",
@@ -801,21 +818,12 @@ def _make_choropleth(df_map, zmin, zmax, center, zoom, indicador_label):
         hover_name="region_name",
     )
     try:
-        # Plotly >= 5.24: MapLibre
-        fig = px.choropleth_map(
-            df_map,
-            map_style=MAP_STYLE,
-            **kwargs_common
-        )
-        return fig
+        fig = px.choropleth_map(df_map, map_style=MAP_STYLE, **kwargs_common)
     except Exception:
         warnings.filterwarnings("ignore", message=".*choropleth_mapbox.*", category=DeprecationWarning)
-        fig = px.choropleth_mapbox(
-            df_map,
-            mapbox_style=MAP_STYLE,
-            **kwargs_common
-        )
-        return fig
+        fig = px.choropleth_mapbox(df_map, mapbox_style=MAP_STYLE, **kwargs_common)
+    return fig
+
 
 # =============================================================================
 # 8) MAP CALLBACK
@@ -884,15 +892,21 @@ def update_map(indicador_label, periodo_idx, filtros, agri_def_label, nivel, esc
         center = relayout_data.get("map.center", center)
 
     # Hover/customdata
-    z = df_map["value_pct"].astype(np.float32).tolist()
-    customdata = np.stack([
+        # Color values
+    z = (df_map["value_pct"].astype("float32").round(1)
+                        .astype("float16").astype(float).tolist())
+
+    # Customdata (round to 1 decimal except sample_n)
+    custom_stack = np.stack([
         df_map["country_name"].astype(str).values,
         df_map["region_name"].astype(str).values,
-        df_map["ci95_lo"].astype(np.float32).values,
-        df_map["ci95_hi"].astype(np.float32).values,
-        df_map["se_pp"].astype(np.float32).values,
-        df_map["sample_n"].astype(np.float32).values,
-    ], axis=-1).tolist()
+        df_map["ci95_lo"].astype("float32").round(1).astype("float16").astype(float).values,
+        df_map["ci95_hi"].astype("float32").round(1).astype("float16").astype(float).values,
+        df_map["se_pp"].astype("float32").round(1).astype("float16").astype(float).values,
+        df_map["sample_n"].astype("float32").round(0).astype("float16").astype(float).values,
+    ], axis=-1)
+    customdata = custom_stack.tolist()
+
 
     subpop_txt = _subset_ui_text(subset_key, agri_def)
     hover_lines = ["<b>%{customdata[0]}</b> – %{customdata[1]}<br>"]
@@ -928,7 +942,10 @@ def update_map(indicador_label, periodo_idx, filtros, agri_def_label, nivel, esc
         return patch, map_title, ""
 
     # Full rebuild
+    geojson_url = "/latam_regiones_simplified.geojson"
+    # Full rebuild
     fig = _make_choropleth(df_map, zmin, zmax, center, zoom, indicador_label)
+
     fig.update_traces(hovertemplate=hovertemplate, customdata=customdata)
 
     nivel_txt = "Nacional" if nivel == "NAT" else "Regional"
@@ -954,3 +971,4 @@ if __name__ == "__main__":
     debug_flag = os.getenv("DASH_DEBUG", "1") == "1"
     print(f"→ Open http://localhost:{port}")
     app.run(host=host, port=port, debug=debug_flag)
+
