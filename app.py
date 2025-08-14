@@ -74,6 +74,9 @@ print("--- STARTING LATAM POVERTY DASHBOARD ---")
 # =============================================================================
 BASE_DIR = Path(__file__).parent.resolve()
 
+NO_DATA_COLOR = "#B0B0B0"  # grey used to paint polygons with no data for the selected period
+NO_DATA_LEGEND_LABEL = "Sin datos (gris)"
+
 DATA_REPO = os.getenv("DATA_REPO", "Fuba311/informe-latino")
 DATA_BRANCH = os.getenv("DATA_BRANCH", "main")
 
@@ -525,9 +528,83 @@ def _bbox_from_features(selected_feature_ids):
     return _center_zoom_from_bbox(lonW, latS, lonE, latN)
 
 def _feature_ids_for_scope(df_map: pd.DataFrame, escala: str, pais_iso3: Optional[str]):
+    """Return the full set of feature ids we want to render for the chosen scope.
+    GLOBAL: every polygon we have in the GeoJSON (so 'no data' still shows in grey).
+    PAIS: all polygons belonging to that ISO3 in the GeoJSON.
+    """
     if escala == "PAIS" and pais_iso3:
         return sorted(list(COUNTRY_FEATURE_IDS.get(pais_iso3, set())))
-    return sorted(df_map["feature_id"].dropna().astype(str).unique().tolist())
+    # GLOBAL: paint everything we have in the GeoJSON, not just the current slice rows
+    return sorted(FEATURE_BY_ID.keys())
+
+def _fill_names_from_geojson(df: pd.DataFrame) -> pd.DataFrame:
+    """Fill missing region/country names for rows created by reindexing to all feature_ids."""
+    if "feature_id" not in df.columns:
+        return df
+    # Ensure columns exist
+    for c in ("region_name", "country_name"):
+        if c not in df.columns:
+            df[c] = pd.Series([None] * len(df), dtype="string")
+    missing = df["region_name"].isna() | (df["region_name"].astype(str) == "nan")
+    if missing.any():
+        fids = df.loc[missing, "feature_id"].astype(str).tolist()
+        reg_names = []
+        country_names = []
+        for fid in fids:
+            props = (FEATURE_BY_ID.get(fid) or {}).get("properties", {})
+            # Try common property names; fall back to id suffix
+            rname = props.get("region_name") or props.get("name") or fid.split("|", 1)[-1]
+            iso3 = fid.split("|", 1)[0] if "|" in fid else (props.get("iso3") or "")
+            cname = COUNTRY_NAME_BY_CODE.get(iso3) or props.get("country_name") or iso3 or "—"
+            reg_names.append(str(rname))
+            country_names.append(str(cname))
+        df.loc[missing, "region_name"] = pd.Series(reg_names, index=df.index[missing], dtype="string")
+        df.loc[missing, "country_name"] = pd.Series(country_names, index=df.index[missing], dtype="string")
+    return df
+
+
+def _add_missing_layer(fig, missing_ids: List[str], use_maplibre: bool):
+    """Overlay a grey layer for polygons without data in the selected period and add a legend entry.
+       NOTE: Choroplethmap (MapLibre) does not support 'opacity', so we avoid it here.
+    """
+    if not missing_ids:
+        return
+
+    const_scale = [[0, NO_DATA_COLOR], [1, NO_DATA_COLOR]]  # e.g., "#B0B0B0"
+
+    if use_maplibre and hasattr(go, "Choroplethmap"):
+        tr = go.Choroplethmap(
+            geojson=GEOJSON_ROUTE,
+            locations=missing_ids,
+            featureidkey="properties.id",
+            z=[0] * len(missing_ids),
+            zmin=0, zmax=1,
+            colorscale=const_scale,
+            showscale=False,
+            hoverinfo="skip",
+            name=NO_DATA_LEGEND_LABEL,
+            showlegend=True,
+            marker=dict(line=dict(width=0)),
+        )
+    else:
+        tr = go.Choroplethmapbox(
+            geojson=GEOJSON_ROUTE,
+            locations=missing_ids,
+            featureidkey="properties.id",
+            z=[0] * len(missing_ids),
+            zmin=0, zmax=1,
+            colorscale=const_scale,
+            showscale=False,
+            hoverinfo="skip",
+            name=NO_DATA_LEGEND_LABEL,
+            showlegend=True,
+            marker=dict(line=dict(width=0)),
+        )
+
+    # Add and push the grey layer *behind* the colored layer
+    fig.add_trace(tr)
+    fig.data = (fig.data[-1],) + fig.data[:-1]
+
 
 # =============================================================================
 # 5) APP INIT & CSS
@@ -799,14 +876,13 @@ def toggle_country_dropdown(modo):
 # =============================================================================
 # 7) MAP BUILDERS
 # =============================================================================
-# 7) MAP BUILDERS
-def _make_choropleth(df_map, zmin, zmax, center, zoom, indicador_label, geojson_url=None):
+def _make_choropleth(df_map, zmin, zmax, center, zoom, indicador_label, missing_ids=None, geojson_url=None):
     # Use your Flask route if nothing is passed in
     if geojson_url is None:
         geojson_url = GEOJSON_ROUTE
 
     kwargs_common = dict(
-        geojson=geojson_url,               # URL (fetched once & cached)
+        geojson=geojson_url,
         locations="feature_id",
         featureidkey="properties.id",
         color="value_pct",
@@ -814,15 +890,42 @@ def _make_choropleth(df_map, zmin, zmax, center, zoom, indicador_label, geojson_
         range_color=(zmin, zmax),
         center=center,
         zoom=zoom,
-        opacity=0.92,
         hover_name="region_name",
     )
+
+    # Try MapLibre first (px.choropleth_map); fallback to Mapbox
     try:
         fig = px.choropleth_map(df_map, map_style=MAP_STYLE, **kwargs_common)
+        maplibre = True
     except Exception:
         warnings.filterwarnings("ignore", message=".*choropleth_mapbox.*", category=DeprecationWarning)
         fig = px.choropleth_mapbox(df_map, mapbox_style=MAP_STYLE, **kwargs_common)
+        maplibre = False
+
+    # (Optional) If you're on Mapbox, and still want some transparency on the colored layer,
+    # only apply opacity to the colored trace(s) to avoid MapLibre incompatibilities.
+    if not maplibre:
+        for tr in fig.data:
+            if getattr(tr, "showscale", False):
+                tr.update(opacity=0.92)
+
+    # Add grey 'no data' layer
+    _add_missing_layer(fig, (missing_ids or []), use_maplibre=maplibre)
+
+    # Legend space for the grey entry
+    fig.update_layout(
+        legend=dict(
+            title="",
+            orientation="h",
+            yanchor="bottom", y=0.015,
+            xanchor="left",   x=0.01,
+            bgcolor="rgba(255,255,255,0.85)",
+            bordercolor="rgba(0,0,0,0.15)",
+            borderwidth=1,
+        )
+    )
     return fig
+
 
 
 # =============================================================================
@@ -844,43 +947,85 @@ def _make_choropleth(df_map, zmin, zmax, center, zoom, indicador_label, geojson_
     [State("mapa", "relayoutData"), State("mapa", "figure")]
 )
 def update_map(indicador_label, periodo_idx, filtros, agri_def_label, nivel, escala, pais_iso3, relayout_data, prev_fig):
+    """
+    Build the map with a grey 'no data' layer. Requires:
+      - _feature_ids_for_scope to return the full set of polygons for the scope
+      - _fill_names_from_geojson to fill names for polygons added by reindexing
+      - _make_choropleth(..., missing_ids=...) to inject the grey layer + legend
+    """
+    # Basic guards (keep original behavior for missing UI state)
     if not indicador_label or not periodo_idx:
-        return go.Figure(), "Selecciona una variable y un periodo", ""
+        fig = go.Figure()
+        fig.add_annotation(text="Selecciona una variable y un periodo",
+                           showarrow=False, y=0.5, x=0.5)
+        fig.update_layout(margin=dict(l=0, r=0, t=0, b=0))
+        return fig, "Selecciona una variable y un periodo", ""
 
     indicador_col = INDICATOR_TO_COL.get(indicador_label, None)
+    if not indicador_col:
+        fig = go.Figure()
+        fig.add_annotation(text="Variable desconocida. Intenta con otra.",
+                           showarrow=False, y=0.5, x=0.5)
+        fig.update_layout(margin=dict(l=0, r=0, t=0, b=0))
+        return fig, indicador_label, ""
+
     periodo_sel = IDX_TO_PERIOD.get(periodo_idx, PERIODOS[-1])
     subset_key, agri_def = resolve_subset(filtros, agri_def_label)
 
-    # Data slice
+    # ---- Data slice
     if nivel == "NAT":
-        df_map = build_national_layer(periodo_sel, subset_key, agri_def, indicador_col,
-                                      country_filter=pais_iso3 if escala == "PAIS" else None)
+        df_map = build_national_layer(
+            periodo_sel,
+            subset_key,
+            agri_def,
+            indicador_col,
+            country_filter=pais_iso3 if escala == "PAIS" else None,
+        )
     else:
-        df_map = _regional_slice(periodo_sel, subset_key, agri_def, indicador_col,
-                                 country_filter=pais_iso3 if (escala == "PAIS" and pais_iso3) else None)
+        df_map = _regional_slice(
+            periodo_sel,
+            subset_key,
+            agri_def,
+            indicador_col,
+            country_filter=pais_iso3 if (escala == "PAIS" and pais_iso3) else None,
+        )
+
+    # ---- Feature subset & row order: always include ALL polygons for scope
+    feature_ids = _feature_ids_for_scope(df_map, escala, pais_iso3)
 
     if df_map is None or df_map.empty:
-        fig = go.Figure()
-        fig.add_annotation(text="Sin datos para esta combinación. Ajusta filtros.",
-                           showarrow=False, y=0.5, x=0.5)
-        fig.update_layout(margin=dict(l=0, r=0, t=0, b=0))
-        return fig, f"{indicador_label} · {('Nacional' if nivel=='NAT' else 'Regional')} · {periodo_sel}", ""
-
-    # Color scale
-    zmin, zmax = _robust_min_max(df_map["value_pct"])
-
-    # Feature subset & row order
-    feature_ids = _feature_ids_for_scope(df_map, escala, pais_iso3)
-    if feature_ids:
+        # Build a base frame with all polygons for the scope (NaNs everywhere)
+        df_map = pd.DataFrame({
+            "feature_id": feature_ids,
+            "country_name": pd.Series([None] * len(feature_ids), dtype="string"),
+            "region_name": pd.Series([None] * len(feature_ids), dtype="string"),
+            "value_pct": np.nan,
+            "se_pp": np.nan,
+            "ci95_lo": np.nan,
+            "ci95_hi": np.nan,
+            "sample_n": np.nan,
+        })
+    else:
+        # Reindex to include polygons with no data, which will be painted grey
         df_map = df_map.set_index("feature_id").reindex(feature_ids).reset_index()
 
-    # Center/zoom
+    # Fill names for polygons that were introduced by reindexing
+    df_map = _fill_names_from_geojson(df_map)
+
+    # ---- Color scale bounds (robust to NaNs)
+    zmin, zmax = _robust_min_max(df_map["value_pct"])
+
+    # ---- Missing ids for the grey layer (NaN value => no data)
+    missing_mask = ~np.isfinite(pd.to_numeric(df_map["value_pct"], errors="coerce"))
+    missing_ids = df_map.loc[missing_mask, "feature_id"].astype(str).tolist()
+
+    # ---- Center/zoom
     if escala == "PAIS" and pais_iso3 and pais_iso3 in COUNTRY_BBOX:
         center, zoom = _center_zoom_from_bbox(*COUNTRY_BBOX[pais_iso3])
     else:
         center, zoom = _bbox_from_features(feature_ids)
 
-    # Preserve user pan/zoom (MapLibre & Mapbox)
+    # Preserve user pan/zoom (Mapbox / MapLibre / generic)
     if relayout_data and "mapbox.center" in relayout_data:
         zoom = relayout_data.get("mapbox.zoom", zoom)
         center = relayout_data.get("mapbox.center", center)
@@ -891,12 +1036,15 @@ def update_map(indicador_label, periodo_idx, filtros, agri_def_label, nivel, esc
         zoom = relayout_data.get("map.zoom", zoom)
         center = relayout_data.get("map.center", center)
 
-    # Hover/customdata
-        # Color values
-    z = (df_map["value_pct"].astype("float32").round(1)
-                        .astype("float16").astype(float).tolist())
+    # ---- Hover/customdata for the colored layer only
+    # (Grey layer is added inside _make_choropleth with hover disabled)
+    z = (
+        df_map["value_pct"]
+        .astype("float32").round(1)
+        .astype("float16").astype(float)
+        .tolist()
+    )
 
-    # Customdata (round to 1 decimal except sample_n)
     custom_stack = np.stack([
         df_map["country_name"].astype(str).values,
         df_map["region_name"].astype(str).values,
@@ -906,7 +1054,6 @@ def update_map(indicador_label, periodo_idx, filtros, agri_def_label, nivel, esc
         df_map["sample_n"].astype("float32").round(0).astype("float16").astype(float).values,
     ], axis=-1)
     customdata = custom_stack.tolist()
-
 
     subpop_txt = _subset_ui_text(subset_key, agri_def)
     hover_lines = ["<b>%{customdata[0]}</b> – %{customdata[1]}<br>"]
@@ -920,46 +1067,49 @@ def update_map(indicador_label, periodo_idx, filtros, agri_def_label, nivel, esc
     ]
     hovertemplate = "".join(hover_lines) + "<extra></extra>"
 
-    # Patch fast path
-    same_scope = False
-    if isinstance(prev_fig, dict) and prev_fig.get("data"):
-        prev_locs = prev_fig["data"][0].get("locations")
-        same_scope = list(prev_locs) == feature_ids
+    # ---- Full rebuild (we intentionally skip the Patch fast path
+    #      so the grey layer stays in sync)
+    fig = _make_choropleth(
+        df_map,
+        zmin,
+        zmax,
+        center,
+        zoom,
+        indicador_label,
+        missing_ids=missing_ids
+    )
 
-    if HAVE_PATCH and same_scope:
-        patch = Patch()
-        patch["data"][0]["z"] = z
-        patch["data"][0]["customdata"] = customdata
-        patch["data"][0]["hovertemplate"] = hovertemplate
-        patch["layout"]["coloraxis"]["cmin"] = zmin
-        patch["layout"]["coloraxis"]["cmax"] = zmax
+    # Apply hover + customdata ONLY to the colored trace (the one with a color scale)
+    def _apply_to_colored(tr):
+        # Choropleth traces that show the colorbar are the colored layer
+        return getattr(tr, "showscale", False) is True
 
-        nivel_txt = "Nacional" if nivel == "NAT" else "Regional"
-        scope_title = COUNTRY_NAME_BY_CODE.get(pais_iso3, "América Latina") if (escala == "PAIS" and pais_iso3) else "América Latina"
-        map_title = f"{indicador_label} · {nivel_txt} · {scope_title} · Periodo {periodo_sel}"
-        if subpop_txt:
-            map_title += f" · Subpoblación: {subpop_txt}"
-        return patch, map_title, ""
+    for tr in fig.data:
+        if _apply_to_colored(tr):
+            tr.hovertemplate = hovertemplate
+            tr.customdata = customdata
+            # Also set z explicitly to keep fast re-draws consistent
+            tr.z = z
 
-    # Full rebuild
-    geojson_url = "/latam_regiones_simplified.geojson"
-    # Full rebuild
-    fig = _make_choropleth(df_map, zmin, zmax, center, zoom, indicador_label)
-
-    fig.update_traces(hovertemplate=hovertemplate, customdata=customdata)
-
+    # ---- Title
     nivel_txt = "Nacional" if nivel == "NAT" else "Regional"
-    scope_title = COUNTRY_NAME_BY_CODE.get(pais_iso3, "América Latina") if (escala == "PAIS" and pais_iso3) else "América Latina"
+    scope_title = (
+        COUNTRY_NAME_BY_CODE.get(pais_iso3, "América Latina")
+        if (escala == "PAIS" and pais_iso3) else "América Latina"
+    )
     map_title = f"{indicador_label} · {nivel_txt} · {scope_title} · Periodo {periodo_sel}"
     if subpop_txt:
         map_title += f" · Subpoblación: {subpop_txt}"
 
+    # ---- Layout polish
     fig.update_layout(
         margin=dict(l=0, r=0, t=0, b=0),
         coloraxis_colorbar=dict(title="%"),
         uirevision="keep",
     )
+
     return fig, map_title, ""
+
 
 # =============================================================================
 # 9) RUN
