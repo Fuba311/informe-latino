@@ -651,48 +651,202 @@ app.index_string = """
     {%favicon%}
     {%css%}
     <style>
-      :root{
-        --brand:#004085; --brand-soft:#e7f3ff; --ink:#333; --muted:#6c757d;
-        --card:#f0f8ff; --border:#cce5ff; --shadow:0 4px 18px rgba(0,0,0,0.08);
-        --panel-bg:#fff; --panel-header:#e9f5ff;
-      }
-      html, body { height: 100%; }
-      body{ font-family:"Segoe UI","Roboto",Arial,sans-serif; background:#f8f9fa; margin:0; }
-      .muted{color:var(--muted);}
-      .section-card{ background:var(--card); border:1px solid var(--border); border-radius:12px;
-        padding:12px 12px; box-shadow:var(--shadow); margin:12px auto; max-width: 100%; overflow: visible; }
-      .floating-controls{ position:absolute; top:16px; left:8px; width:360px; background:var(--panel-bg);
-        border:1px solid #e9ecef; border-radius:12px; box-shadow:var(--shadow);
-        overflow:visible !important; z-index:2000; transition:width .2s ease; }
-      .floating-controls.icon-only{ width:46px; overflow:hidden !important; }
-      .control-panel-header{ display:flex; align-items:center; gap:10px; padding:12px 14px;
-        background:var(--panel-header); border-bottom:1px solid #d6ebff; cursor:pointer; }
-      .control-panel-header .header-icon{font-size:18px;}
-      .control-panel-header .header-text{font-weight:700;color:var(--brand);font-size:15px;}
-      .toggle-btn{ margin-left:auto; border:1px solid var(--brand); background:var(--brand-soft);
-        color:var(--brand); border-radius:8px; font-size:12px; padding:4px 10px; cursor:pointer; }
-      .controls-content{ padding:14px; max-height:74vh; overflow-y:auto; }
-      .controls-content.hidden{display:none;}
-      .controls-content > div { margin-bottom: 16px; }
-      .controls-content label { display:block; font-weight:700; font-size:14px; margin-bottom:6px; }
-      .lifted-dropdown .Select-menu-outer, .lifted-dropdown .Select__menu{ z-index:3000 !important; }
-      .title-wrap{ position:absolute; top:14px; left:50%; transform:translateX(-50%);
-        z-index:1200; text-align:center; pointer-events:none; }
-      .title-chip{ background:rgba(255,255,255,.95); padding:8px 20px; border-radius:20px;
-        font-size:14px; font-weight:700; color:#004085; box-shadow:0 2px 8px rgba(0,0,0,.12);
-        border:1px solid rgba(0,64,133,.2); display:inline-block; }
-      .title-spinner{ margin-top: 10px; }
-      .title-spinner .dash-spinner{ transform:scale(.8); opacity:.85; }
-      @media (max-width:900px){
+    :root{
+        /* Rimisp green palette */
+        --brand:#598e7d;            /* dominant Rimisp green */
+        --brand-deep:#477264;       /* darker accent */
+        --brand-soft:#ebf1ef;       /* very light greenish background */
+        --ink:#2f3b35;
+        --muted:#6b7b75;
+
+        --card:#f7faf9;
+        --border:#cdddd8;
+        --shadow:0 4px 18px rgba(0,0,0,0.08);
+        --panel-bg:#fff;
+        --panel-header:#ecf3f1;
+
+        /* Layout knobs (so you can tweak easily) */
+        --page-side-margins: 8cm;   /* ≈4 cm on each side */
+        --page-max: 1600px;         /* maximum working width */
+    }
+
+    html, body { height: 100%; }
+    body{
+        font-family:"Segoe UI","Roboto",Arial,sans-serif;
+        background:#f8fbf9;
+        margin:0;
+        color:var(--ink);
+    }
+    .muted{color:var(--muted);}
+
+    /* Rimisp brand header (logo at upper-left) */
+    .brand-header{
+        background:var(--brand);
+        padding:10px 16px;
+        display:flex; align-items:center; gap:12px;
+        box-shadow:var(--shadow);
+    }
+    .brand-header img{ height:42px; display:block; }
+    .brand-header .app-name{
+        color:#fff; font-weight:700; font-size:16px; letter-spacing:.2px; opacity:.95;
+    }
+
+    /* Hero/title: same narrow width as map + extra breathing room */
+    .hero{
+        width: clamp(320px, calc(100vw - var(--page-side-margins)), var(--page-max));
+        margin: 32px auto 28px; padding: 18px 0;
+    }
+    .hero h1{
+        text-align:center; color:var(--brand-deep);
+        margin:8px 0 10px; font-size:30px; line-height:1.15;
+    }
+    .hero p { text-align:center; margin:4px 0; font-size:16px; line-height:1.35;}
+
+    /* The rounded “outer box” now matches the map’s narrow width */
+    .section-card{
+        background:var(--card);
+        border:1px solid var(--border);
+        border-radius:16px;
+        padding:12px 12px;
+        box-shadow:var(--shadow);
+        margin:12px auto;
+        width: clamp(320px, calc(100vw - var(--page-side-margins)), var(--page-max));
+        overflow: visible; /* so floating panel/menus can extend */
+    }
+
+    /* Map area: narrower, centered (≈4 cm per side), full height */
+    #map-container {
+        position: relative;
+        height: calc(100vh - 150px);
+        width: clamp(320px, calc(100vw - var(--page-side-margins)), var(--page-max));
+        margin: 0 auto;               /* center in the page */
+        overflow: visible;
+    }
+
+    /* Floating “Controles” panel — rounded & animated */
+    .floating-controls{
+        position:absolute; top:16px; left:8px; width:320px;  /* narrower than before */
+        background:var(--panel-bg);
+        border:1px solid var(--border);
+        border-radius:14px; box-shadow:var(--shadow);
+        overflow:visible !important; z-index:2000;
+        transition: width .28s ease, transform .25s ease, box-shadow .25s ease;
+        will-change: width, transform;
+    }
+    .floating-controls.icon-only{ width:46px; overflow:hidden !important; }
+
+    /* Rounded header + nicer toggle */
+    .control-panel-header{
+        display:flex; align-items:center; gap:10px; padding:12px 14px;
+        background:var(--panel-header); border-bottom:1px solid var(--border);
+        cursor:pointer; border-top-left-radius:14px; border-top-right-radius:14px;
+    }
+    .control-panel-header .header-icon{font-size:18px;}
+    .control-panel-header .header-text{font-weight:700;color:var(--brand-deep);font-size:15px;}
+    .toggle-btn{
+        margin-left:auto; border:1px solid var(--brand); background:var(--brand-soft);
+        color:var(--brand-deep); border-radius:999px; width:28px; height:28px; line-height:26px;
+        font-size:14px; padding:0; cursor:pointer; transition: transform .25s ease, background .2s ease;
+    }
+    .floating-controls.icon-only .toggle-btn{ transform: rotate(180deg); }
+
+    /* Animated open/close for the content (no “display:none”; smooth collapse) */
+    .controls-content{
+        padding:14px; max-height:74vh; overflow-y:auto;
+        transition: max-height .3s ease, opacity .25s ease, padding .2s ease;
+        opacity:1;
+        border-bottom-left-radius:14px; border-bottom-right-radius:14px;
+    }
+    .controls-content.hidden{
+        max-height:0; opacity:0; padding-top:0; padding-bottom:0; overflow:hidden;
+    }
+
+    .controls-content > div { margin-bottom: 16px; }
+    .controls-content label { display:block; font-weight:700; font-size:14px; margin-bottom:6px; }
+
+    /* Dropdown look & feel: rounded, and menus can extend beyond the panel */
+    .lifted-dropdown .Select-control,
+    .lifted-dropdown .Select__control{
+        border-radius:10px !important;
+        border-color: var(--border) !important;
+        box-shadow:none !important;
+    }
+    /* Menus: raise z-index and allow them to be wider than the panel */
+    .lifted-dropdown .Select-menu-outer,
+    .lifted-dropdown .Select__menu{
+        z-index:4000 !important;
+        width: max(260px, calc(100% + 140px));   /* extend beyond panel when needed */
+        max-width: 80vw;
+        box-shadow: 0 12px 24px rgba(0,0,0,.16);
+        border-radius: 10px;
+    }
+    .lifted-dropdown .Select-menu { max-height: 50vh; } /* comfortable scrolling */
+
+    /* Title chip on the map */
+    .title-wrap{
+        position:absolute; top:14px; left:50%; transform:translateX(-50%);
+        z-index:1200; text-align:center; pointer-events:none;
+    }
+    .title-chip{
+        background:rgba(255,255,255,.95); padding:8px 20px; border-radius:20px;
+        font-size:14px; font-weight:700; color:var(--brand-deep);
+        box-shadow:0 2px 8px rgba(0,0,0,.12);
+        border:1px solid rgba(89,142,125,.25);
+        display:inline-block;
+    }
+    .title-spinner{ margin-top: 10px; }
+    .title-spinner .dash-spinner{ transform:scale(.8); opacity:.85; }
+
+    @media (max-width:900px){
         .floating-controls{ top:56px; left:6px; width:86vw; }
         .floating-controls.icon-only{ width:44px; }
-      }
-      .hero{ margin-bottom:28px; }
-      .hero h1{ text-align:center; color:var(--brand); margin:8px 0 6px; font-size:28px; line-height:1.15;}
-      .hero p { text-align:center; margin:0; font-size:16px; line-height:1.35;}
-      #map-container { height: calc(100vh - 150px); width: 100%; }
-      .controls-content{ padding-bottom: 280px; }
+    }
+    /* leave extra bottom room so controls never overlap */
+    .controls-content{ padding-bottom: 280px; }
+    /* --- Menus for AGRÍCOLA and PAÍS: open just below, can overflow panel --- */
+    #dd-agri-def, #dd-pais { position: relative; } /* anchor point */
+
+    #dd-agri-def .Select-menu-outer, #dd-pais .Select-menu-outer,
+    #dd-agri-def .Select__menu,      #dd-pais .Select__menu{
+    position: absolute !important;    /* keep them attached to the input */
+    left: 0 !important;
+    top: calc(100% + 6px) !important; /* just below the control */
+    z-index: 5000 !important;         /* above the map */
+    min-width: 260px;
+    width: max(100%, 420px);          /* a bit wider than the input */
+    max-width: min(80vw, 560px);
+    max-height: 56vh;                 /* don’t run off-screen */
+    overflow-y: auto;
+    border-radius: 10px;
+    box-shadow: 0 12px 24px rgba(0,0,0,.16);
+    }
+
+    /* Ensure nothing clips those menus */
+    .section-card, #map-container, .floating-controls, .controls-content { overflow: visible !important; }
+
+    /* End the panel shortly after the PAÍS dropdown (no giant blank tail) */
+    .controls-content{ padding-bottom: 24px; }
+
+    /* --- Replace the default map attribution with our own footer (see layout edit) --- */
+    /* Hide the built-in overlays (MapboxGL or MapLibreGL) inside the map container */
+    #map-container .mapboxgl-ctrl-attrib,
+    #map-container .maplibregl-ctrl-attrib,
+    #map-container .mapboxgl-ctrl-logo{
+    display: none !important;
+    }
+
+    /* (Alternative) If you prefer to keep the on-map overlay but subtler, comment the three
+    rules above and use the following restyle instead:
+    #map-container .mapboxgl-ctrl-attrib,
+    #map-container .maplibregl-ctrl-attrib{
+    font-size: 10px; color: rgba(0,0,0,.45);
+    background: rgba(255,255,255,.7); border-radius: 6px; padding: 2px 6px;
+    }
+    */
+
     </style>
+
+
   </head>
   <body>
     {%app_entry%}
@@ -709,6 +863,21 @@ app.layout = html.Div(
     style={"padding": "10px"},
     children=[
         html.Div(
+            className="brand-header",
+            children=[
+                html.A(
+                    href="https://rimisp.org",
+                    target="_blank",
+                    children=html.Img(
+                        src="https://rimisp.org/wp-content/uploads/2023/03/logo-rimisp-blanco.png",
+                        alt="Rimisp — Centro Latinoamericano para el Desarrollo Rural"
+                    ),
+                ),
+                html.Span("Rimisp — Centro Latinoamericano para el Desarrollo Rural", className="app-name")
+            ],
+        ),
+
+        html.Div(
             className="hero",
             children=[
                 html.H1("Mapa de Pobreza Territorial en América Latina"),
@@ -721,7 +890,13 @@ app.layout = html.Div(
             children=[
                 html.Div(
                     id="map-container",
-                    style={"position": "relative", "width": "100%", "overflow": "visible"},
+                    style={
+                        "position": "relative",
+                        "width": "clamp(320px, calc(100vw - 8cm), 1600px)",  # ~4 cm per side, responsive
+                        "margin": "0 auto",                                  # center
+                        "overflow": "visible"
+                    },
+
                     children=[
                         html.Div(
                             id={"type": "floating-panel-wrapper", "index": "map"},
@@ -833,11 +1008,38 @@ app.layout = html.Div(
                                 ),
                             ],
                         ),
+                        # --- Map figure ---
                         dcc.Graph(
                             id="mapa",
                             style={"height": "100%", "width": "100%"},
-                            config=GRAPH_CONFIG
+                            config=GRAPH_CONFIG,
                         ),
+
+                        # --- Attribution footer (license-compliant, off-map) ---
+                        html.Div(
+                            id="map-attrib",
+                            style={
+                                "textAlign": "right",
+                                "fontSize": "11px",
+                                "color": "#6b7b75",
+                                "padding": "6px 10px 2px",
+                            },
+                            children=[
+                                html.Span("Map data © "),
+                                html.A(
+                                    "OpenStreetMap contributors",
+                                    href="https://www.openstreetmap.org/copyright",
+                                    target="_blank",
+                                ),
+                                html.Span(" • Basemap © "),
+                                html.A(
+                                    "CARTO",
+                                    href="https://carto.com/attributions",
+                                    target="_blank",
+                                ),
+                            ],
+                        ),
+
                     ],
                 )
             ],
@@ -1112,7 +1314,6 @@ def update_map(indicador_label, periodo_idx, filtros, agri_def_label, nivel, esc
         uirevision="keep",
     )
     return fig, map_title, ""
-
 
 
 # =============================================================================
