@@ -266,6 +266,83 @@ BASE_COLS = [
     "value_pct","se_pp","ci95_lo","ci95_hi","sample_n",
 ]
 
+
+CLIMATE_VARIABLES = [
+    {
+        "value": "pe_mpy_cal_r1_tmax_p",
+        "label": "Temp. máxima · Choque positivo (meses, 2015-2022)",
+        "time_variant": False,
+        "colorbar": "Meses promedio (2015-2022)",
+        "hover_suffix": "meses promedio (2015-2022)",
+    },
+    {
+        "value": "pe_mpy_cal_r1_tmax_n",
+        "label": "Temp. máxima · Choque negativo (meses, 2015-2022)",
+        "time_variant": False,
+        "colorbar": "Meses promedio (2015-2022)",
+        "hover_suffix": "meses promedio (2015-2022)",
+    },
+    {
+        "value": "pe_mpy_cal_r1_prec_p",
+        "label": "Precipitación · Choque positivo (meses, 2015-2022)",
+        "time_variant": False,
+        "colorbar": "Meses promedio (2015-2022)",
+        "hover_suffix": "meses promedio (2015-2022)",
+    },
+    {
+        "value": "pe_mpy_cal_r1_prec_n",
+        "label": "Precipitación · Choque negativo (meses, 2015-2022)",
+        "time_variant": False,
+        "colorbar": "Meses promedio (2015-2022)",
+        "hover_suffix": "meses promedio (2015-2022)",
+    },
+    {
+        "value": "per_tot_m12_cal_n_tmax",
+        "label": "Temp. máxima · Exposición choque negativo (persona-mes, 12m)",
+        "time_variant": True,
+        "colorbar": "Persona-mes promedio (12m)",
+        "hover_suffix": "persona-mes promedio (últimos 12 meses)",
+    },
+    {
+        "value": "per_tot_m12_cal_p_tmax",
+        "label": "Temp. máxima · Exposición choque positivo (persona-mes, 12m)",
+        "time_variant": True,
+        "colorbar": "Persona-mes promedio (12m)",
+        "hover_suffix": "persona-mes promedio (últimos 12 meses)",
+    },
+    {
+        "value": "per_tot_m12_cal_n_prec",
+        "label": "Precipitación · Exposición choque negativo (persona-mes, 12m)",
+        "time_variant": True,
+        "colorbar": "Persona-mes promedio (12m)",
+        "hover_suffix": "persona-mes promedio (últimos 12 meses)",
+    },
+    {
+        "value": "per_tot_m12_cal_p_prec",
+        "label": "Precipitación · Exposición choque positivo (persona-mes, 12m)",
+        "time_variant": True,
+        "colorbar": "Persona-mes promedio (12m)",
+        "hover_suffix": "persona-mes promedio (últimos 12 meses)",
+    },
+]
+
+CLIMATE_OPTIONS = [{"label": meta["label"], "value": meta["value"]} for meta in CLIMATE_VARIABLES]
+CLIMATE_LABELS = {meta["value"]: meta["label"] for meta in CLIMATE_VARIABLES}
+CLIMATE_TIME_VARIANT = {meta["value"]: meta["time_variant"] for meta in CLIMATE_VARIABLES}
+CLIMATE_COLORBAR = {meta["value"]: meta.get("colorbar", "Valor") for meta in CLIMATE_VARIABLES}
+CLIMATE_HOVER_SUFFIX = {meta["value"]: meta.get("hover_suffix", "valor") for meta in CLIMATE_VARIABLES}
+
+
+def _weighted_average(values: pd.Series, weights: pd.Series) -> float:
+    vals = pd.to_numeric(values, errors="coerce") if values is not None else pd.Series(dtype="float64")
+    w = pd.to_numeric(weights, errors="coerce") if weights is not None else pd.Series(dtype="float64")
+    if vals.empty or w.empty:
+        return float("nan")
+    mask = vals.notna() & w.notna() & (w > 0)
+    if not mask.any():
+        return float("nan")
+    return float(np.average(vals[mask], weights=w[mask]))
+
 if USE_DATASET:
     DS = ds.dataset(str(DISCOVERED_DATASET_DIR), format="parquet", partitioning="hive")
     print(f"ℹ Using partitioned dataset at {DISCOVERED_DATASET_DIR}")
@@ -377,6 +454,84 @@ if USE_DATASET:
     def build_national_layer(periodo_sel, subset_key, agri_def, indicator_col, country_filter=None):
         return _national_layer_all_countries(periodo_sel, subset_key, agri_def, indicator_col, country_filter)
 
+
+    @lru_cache(maxsize=32)
+    def _climate_regions(climate_col: str, country_filter: Optional[str], periodo_sel: Optional[str], time_variant: bool) -> pd.DataFrame:
+        cols = [
+            "country_code","country_name","region_code","region_name","feature_id","periodo",
+            climate_col,"pop_weight_sum",
+        ]
+        filt = (
+            (ds.field("region_code") > 0) &
+            (ds.field("subset_key") == "Todos") &
+            (ds.field("agri_def") == "N/A") &
+            (ds.field("indicator_col") == "mpi_poor")
+        )
+        if country_filter:
+            filt = filt & (ds.field("country_code") == country_filter)
+        if time_variant and periodo_sel:
+            filt = filt & (ds.field("periodo") == periodo_sel)
+        df = _scan(cols, filt)
+        if df.empty or climate_col not in df.columns:
+            return pd.DataFrame()
+        if time_variant and periodo_sel:
+            df = df[df["periodo"].astype(str) == periodo_sel]
+        else:
+            df = df.sort_values("periodo").drop_duplicates(["country_code","region_code"], keep="last")
+        if df.empty:
+            return pd.DataFrame()
+        df["value_pct"] = pd.to_numeric(df[climate_col], errors="coerce").astype("float32")
+        if "pop_weight_sum" in df.columns:
+            df["pop_weight_sum"] = pd.to_numeric(df["pop_weight_sum"], errors="coerce").astype("float32")
+        else:
+            df["pop_weight_sum"] = np.nan
+        df = df.drop(columns=[climate_col])
+        df["ci95_lo"] = np.nan
+        df["ci95_hi"] = np.nan
+        df["se_pp"] = np.nan
+        df["sample_n"] = np.nan
+        df["indicator_label"] = CLIMATE_LABELS[climate_col]
+        df["indicator_col"] = climate_col
+        df["subset_key"] = "Todos"
+        df["agri_def"] = "N/A"
+        df["periodo"] = periodo_sel if (time_variant and periodo_sel is not None) else "2015-2022"
+        df = df[df["value_pct"].notna()].reset_index(drop=True)
+        for c in ("country_code","country_name","region_name","indicator_label","feature_id"):
+            if c in df.columns:
+                df[c] = df[c].astype("string")
+        return df
+
+
+    @lru_cache(maxsize=32)
+    def _climate_national(climate_col: str, country_filter: Optional[str], periodo_sel: Optional[str], time_variant: bool) -> pd.DataFrame:
+        base = _climate_regions(climate_col, None, periodo_sel, time_variant)
+        if base.empty:
+            return base.copy()
+        weights = base.groupby("country_code", observed=True)["pop_weight_sum"].sum().astype("float32")
+        agg = base.groupby("country_code", observed=True).apply(
+            lambda g: _weighted_average(g["value_pct"], g.get("pop_weight_sum"))
+        ).astype("float32")
+        skeleton_period = periodo_sel if (time_variant and periodo_sel is not None) else PERIODOS[-1]
+        skeleton = _regions_skeleton(skeleton_period).copy()
+        if country_filter:
+            skeleton = skeleton[skeleton["country_code"] == country_filter]
+        skeleton["value_pct"] = pd.to_numeric(skeleton["country_code"].map(agg), errors="coerce").astype("float32")
+        skeleton["pop_weight_sum"] = pd.to_numeric(skeleton["country_code"].map(weights.to_dict()), errors="coerce").astype("float32")
+        skeleton["ci95_lo"] = np.nan
+        skeleton["ci95_hi"] = np.nan
+        skeleton["se_pp"] = np.nan
+        skeleton["sample_n"] = np.nan
+        skeleton["indicator_label"] = CLIMATE_LABELS[climate_col]
+        skeleton["indicator_col"] = climate_col
+        skeleton["subset_key"] = "Todos"
+        skeleton["agri_def"] = "N/A"
+        skeleton["periodo"] = periodo_sel if (time_variant and periodo_sel is not None) else "2015-2022"
+        for c in ("country_code","country_name","region_name","indicator_label","feature_id"):
+            if c in skeleton.columns:
+                skeleton[c] = skeleton[c].astype("string")
+        return skeleton.reset_index(drop=True)
+
+
 else:
     # -------------------- Monolithic fallback --------------------
     print("ℹ Using monolithic Parquet (no dataset dir found).")
@@ -407,6 +562,101 @@ else:
                  .sort_values("country_name"))
     COUNTRY_OPTIONS = [{"label": n, "value": c} for c, n in zip(countries["country_code"], countries["country_name"])]
     COUNTRY_NAME_BY_CODE = dict(zip(countries["country_code"], countries["country_name"]))
+
+
+    @lru_cache(maxsize=32)
+    def _climate_regions(climate_col: str, country_filter: Optional[str], periodo_sel: Optional[str], time_variant: bool) -> pd.DataFrame:
+        if climate_col not in panel.columns:
+            return pd.DataFrame()
+        mask = (
+            panel["region_code"].astype("int64") > 0
+        ) & (
+            panel["subset_key"] == "Todos"
+        ) & (
+            panel["agri_def"] == "N/A"
+        ) & (
+            panel["indicator_col"] == "mpi_poor"
+        )
+        if time_variant and periodo_sel:
+            mask = mask & (panel["periodo"].astype(str) == str(periodo_sel))
+        cols = ["country_code","country_name","region_code","region_name","feature_id","periodo", climate_col,"pop_weight_sum"]
+        df = panel.loc[mask, cols].copy()
+        if df.empty:
+            return df
+        if country_filter:
+            df = df[df["country_code"] == country_filter]
+        if df.empty:
+            return df
+        if time_variant and periodo_sel:
+            df = df[df["periodo"].astype(str) == str(periodo_sel)]
+        else:
+            df = df.sort_values("periodo").drop_duplicates(["country_code","region_code"], keep="last")
+        if df.empty:
+            return pd.DataFrame()
+        df["value_pct"] = pd.to_numeric(df[climate_col], errors="coerce").astype("float32")
+        if "pop_weight_sum" in df.columns:
+            df["pop_weight_sum"] = pd.to_numeric(df["pop_weight_sum"], errors="coerce").astype("float32")
+        else:
+            df["pop_weight_sum"] = np.nan
+        df = df.drop(columns=[climate_col])
+        df["ci95_lo"] = np.nan
+        df["ci95_hi"] = np.nan
+        df["se_pp"] = np.nan
+        df["sample_n"] = np.nan
+        df["indicator_label"] = CLIMATE_LABELS[climate_col]
+        df["indicator_col"] = climate_col
+        df["subset_key"] = "Todos"
+        df["agri_def"] = "N/A"
+        df["periodo"] = str(periodo_sel) if (time_variant and periodo_sel is not None) else "2015-2022"
+        df = df[df["value_pct"].notna()].reset_index(drop=True)
+        for c in ("country_code","country_name","region_name","indicator_label","feature_id"):
+            if c in df.columns:
+                df[c] = df[c].astype("string")
+        return df
+
+
+    @lru_cache(maxsize=32)
+    def _climate_national(climate_col: str, country_filter: Optional[str], periodo_sel: Optional[str], time_variant: bool) -> pd.DataFrame:
+        base = _climate_regions(climate_col, None, periodo_sel, time_variant)
+        if base.empty:
+            return base.copy()
+        weights = base.groupby("country_code", observed=True)["pop_weight_sum"].sum().astype("float32")
+        agg = base.groupby("country_code", observed=True).apply(
+            lambda g: _weighted_average(g["value_pct"], g["pop_weight_sum"])
+        ).astype("float32")
+        if time_variant and periodo_sel is not None:
+            skeleton = REGIONS_BY_PERIOD.get(str(periodo_sel))
+        else:
+            skeleton = REGIONS_BY_PERIOD.get(str(PERIODOS[-1]))
+        if skeleton is None or skeleton.empty:
+            target_period = str(periodo_sel) if (time_variant and periodo_sel is not None) else str(PERIODOS[-1])
+            skeleton = panel[
+                (panel["periodo"].astype(str) == target_period) &
+                (panel["region_code"].astype("int64") > 0)
+            ][["country_code","country_name","region_code","region_name","feature_id"]].drop_duplicates().copy()
+        else:
+            skeleton = skeleton.copy()
+        if country_filter:
+            skeleton = skeleton[skeleton["country_code"] == country_filter]
+        skeleton_period = str(periodo_sel) if (time_variant and periodo_sel is not None) else "2015-2022"
+        skeleton["value_pct"] = pd.to_numeric(skeleton["country_code"].map(agg), errors="coerce").astype("float32")
+        skeleton["pop_weight_sum"] = pd.to_numeric(
+            skeleton["country_code"].map(weights.to_dict()), errors="coerce"
+        ).astype("float32")
+        skeleton["ci95_lo"] = np.nan
+        skeleton["ci95_hi"] = np.nan
+        skeleton["se_pp"] = np.nan
+        skeleton["sample_n"] = np.nan
+        skeleton["indicator_label"] = CLIMATE_LABELS[climate_col]
+        skeleton["indicator_col"] = climate_col
+        skeleton["subset_key"] = "Todos"
+        skeleton["agri_def"] = "N/A"
+        skeleton["periodo"] = skeleton_period
+        for c in ("country_code","country_name","region_name","indicator_label","feature_id"):
+            if c in skeleton.columns:
+                skeleton[c] = skeleton[c].astype("string")
+        return skeleton.reset_index(drop=True)
+
 
     def _clean_agri_label(s: str) -> str:
         if not isinstance(s, str): return s
@@ -468,6 +718,16 @@ else:
 
     def build_national_layer(periodo_sel, subset_key, agri_def, indicator_col, country_filter=None):
         return _national_layer_all_countries(periodo_sel, subset_key, agri_def, indicator_col, country_filter)
+
+
+def climate_regions(climate_col: str, country_filter: Optional[str] = None, periodo_sel: Optional[str] = None, time_variant: bool = False) -> pd.DataFrame:
+    df = _climate_regions(climate_col, country_filter, periodo_sel, time_variant)
+    return df.copy() if isinstance(df, pd.DataFrame) else df
+
+def climate_national(climate_col: str, country_filter: Optional[str] = None, periodo_sel: Optional[str] = None, time_variant: bool = False) -> pd.DataFrame:
+    df = _climate_national(climate_col, country_filter, periodo_sel, time_variant)
+    return df.copy() if isinstance(df, pd.DataFrame) else df
+
 
 # =============================================================================
 # 4) SHARED HELPERS
@@ -775,10 +1035,20 @@ app.index_string = """
     .lifted-dropdown .Select-menu-outer,
     .lifted-dropdown .Select__menu{
         z-index:4000 !important;
-        width: max(260px, calc(100% + 140px));   /* extend beyond panel when needed */
-        max-width: 80vw;
+        min-width: 360px;
+        width: max(360px, calc(100% + 240px));   /* extend beyond panel when needed */
+        max-width: min(620px, 90vw);
         box-shadow: 0 12px 24px rgba(0,0,0,.16);
         border-radius: 10px;
+    }
+    .lifted-dropdown .Select-option,
+    .lifted-dropdown .Select__option{
+        padding: 16px 20px !important;
+        line-height: 1.65 !important;
+        margin: 6px 4px !important;
+        white-space: normal !important;
+        word-break: normal !important;
+        border-radius: 8px !important;
     }
     .lifted-dropdown .Select-menu { max-height: 50vh; } /* comfortable scrolling */
 
@@ -917,15 +1187,44 @@ app.layout = html.Div(
                                     className="controls-content",
                                     children=[
                                         html.Div([
-                                            html.Label("📊 Variable de pobreza"),
-                                            dcc.Dropdown(
-                                                id="dd-indicador",
-                                                className="lifted-dropdown",
-                                                options=INDICATOR_OPTIONS,
-                                                value=INDICATOR_OPTIONS[0]["value"] if INDICATOR_OPTIONS else None,
-                                                clearable=False,
+                                            html.Label("Tipo de indicador"),
+                                            dcc.RadioItems(
+                                                id="radio-variable-mode",
+                                                options=[
+                                                    {"label": " Pobreza", "value": "POBREZA"},
+                                                    {"label": " Choques climaticos", "value": "CLIMA"},
+                                                ],
+                                                value="POBREZA",
+                                                inline=True,
                                             ),
                                         ]),
+                                        html.Div(
+                                            id="selector-pobreza",
+                                            children=[
+                                                html.Label("Variable de pobreza"),
+                                                dcc.Dropdown(
+                                                    id="dd-indicador",
+                                                    className="lifted-dropdown",
+                                                    options=INDICATOR_OPTIONS,
+                                                    value=INDICATOR_OPTIONS[0]["value"] if INDICATOR_OPTIONS else None,
+                                                    clearable=False,
+                                                ),
+                                            ],
+                                        ),
+                                        html.Div(
+                                            id="selector-clima",
+                                            style={"display": "none"},
+                                            children=[
+                                                html.Label("Choque climatico"),
+                                                dcc.Dropdown(
+                                                    id="dd-clima",
+                                                    className="lifted-dropdown",
+                                                    options=CLIMATE_OPTIONS,
+                                                    value=CLIMATE_OPTIONS[0]["value"] if CLIMATE_OPTIONS else None,
+                                                    clearable=False,
+                                                ),
+                                            ],
+                                        ),
                                         html.Div([
                                             html.Label("📅 Periodo"),
                                             dcc.Slider(
@@ -1074,6 +1373,18 @@ def toggle_agri_def(filtros):
 def toggle_country_dropdown(modo):
     return (modo != "PAIS")
 
+@app.callback(
+    [Output("selector-pobreza", "style"),
+     Output("selector-clima", "style"),
+     Output("sl-periodo", "disabled")],
+    [Input("radio-variable-mode", "value"), Input("dd-clima", "value")]
+)
+def toggle_variable_mode(mode, clima_value):
+    if mode == "CLIMA":
+        time_variant = CLIMATE_TIME_VARIANT.get(clima_value, False)
+        return {"display": "none"}, {"display": "block"}, (not time_variant)
+    return {}, {"display": "none"}, False
+
 
 # =============================================================================
 # 7) MAP BUILDERS
@@ -1138,7 +1449,9 @@ def _make_choropleth(df_map, zmin, zmax, center, zoom, indicador_label, missing_
      Output("map-title", "children"),
      Output("map-loading-sentinel", "children")],
     [
+        Input("radio-variable-mode", "value"),
         Input("dd-indicador", "value"),
+        Input("dd-clima", "value"),
         Input("sl-periodo", "value"),
         Input("chk-filtros", "value"),
         Input("dd-agri-def", "value"),
@@ -1148,44 +1461,59 @@ def _make_choropleth(df_map, zmin, zmax, center, zoom, indicador_label, missing_
     ],
     [State("mapa", "relayoutData"), State("mapa", "figure")]
 )
-def update_map(indicador_label, periodo_idx, filtros, agri_def_label, nivel, escala, pais_iso3, relayout_data, prev_fig):
-    """
-    Build the map with a grey 'no data' layer, without breaking hover:
-      - Colored layer uses ONLY rows with data (df_color).
-      - Grey layer covers polygons with no data (missing_ids).
-    """
-    # Basic guards
-    if not indicador_label or not periodo_idx:
-        fig = go.Figure()
-        fig.add_annotation(text="Selecciona una variable y un periodo",
-                           showarrow=False, y=0.5, x=0.5)
-        fig.update_layout(margin=dict(l=0, r=0, t=0, b=0))
-        return fig, "Selecciona una variable y un periodo", ""
+def update_map(variable_mode, indicador_label, clima_value, periodo_idx, filtros, agri_def_label, nivel, escala, pais_iso3, relayout_data, prev_fig):
+    """Render choropleth maps for pobreza indicators or climate shocks."""
+    is_climate = variable_mode == "CLIMA"
+    pais_filter = pais_iso3 if escala == "PAIS" and pais_iso3 else None
 
-    indicador_col = INDICATOR_TO_COL.get(indicador_label)
-    if not indicador_col:
-        fig = go.Figure()
-        fig.add_annotation(text="Variable desconocida. Intenta con otra.",
-                           showarrow=False, y=0.5, x=0.5)
-        fig.update_layout(margin=dict(l=0, r=0, t=0, b=0))
-        return fig, indicador_label, ""
+    colorbar_title = "%"
+    periodo_display = ""
+    subpop_txt = ""
 
-    periodo_sel = IDX_TO_PERIOD.get(periodo_idx, PERIODOS[-1])
-    subset_key, agri_def = resolve_subset(filtros, agri_def_label)
+    if is_climate:
+        if not clima_value:
+            fig = go.Figure()
+            fig.add_annotation(text="Selecciona un choque climático", showarrow=False, y=0.5, x=0.5)
+            fig.update_layout(margin=dict(l=0, r=0, t=0, b=0))
+            return fig, "Selecciona un choque climático", ""
 
-    # ---- Data slice
-    if nivel == "NAT":
-        df_map = build_national_layer(
-            periodo_sel, subset_key, agri_def, indicador_col,
-            country_filter=pais_iso3 if escala == "PAIS" else None
-        )
+        indicador_label = CLIMATE_LABELS.get(clima_value, clima_value or "Choque climático")
+        subset_key, agri_def = "Todos", "N/A"
+        time_variant = CLIMATE_TIME_VARIANT.get(clima_value, False)
+        if time_variant:
+            periodo_sel = IDX_TO_PERIOD.get(periodo_idx, PERIODOS[-1])
+            periodo_display = f"Periodo {periodo_sel}"
+        else:
+            periodo_sel = None
+            periodo_display = "2015-2022 (promedio)"
+        colorbar_title = CLIMATE_COLORBAR.get(clima_value, "Valor")
+        if nivel == "NAT":
+            df_map = climate_national(clima_value, pais_filter, periodo_sel, time_variant)
+        else:
+            df_map = climate_regions(clima_value, pais_filter, periodo_sel, time_variant)
     else:
-        df_map = _regional_slice(
-            periodo_sel, subset_key, agri_def, indicador_col,
-            country_filter=pais_iso3 if (escala == "PAIS" and pais_iso3) else None
-        )
+        if not indicador_label or not periodo_idx:
+            fig = go.Figure()
+            fig.add_annotation(text="Selecciona una variable y un periodo", showarrow=False, y=0.5, x=0.5)
+            fig.update_layout(margin=dict(l=0, r=0, t=0, b=0))
+            return fig, "Selecciona una variable y un periodo", ""
 
-    # ---- Feature subset & row order: include ALL polygons for scope
+        indicador_col = INDICATOR_TO_COL.get(indicador_label)
+        if not indicador_col:
+            fig = go.Figure()
+            fig.add_annotation(text="Variable desconocida. Intenta con otra.", showarrow=False, y=0.5, x=0.5)
+            fig.update_layout(margin=dict(l=0, r=0, t=0, b=0))
+            return fig, indicador_label, ""
+
+        periodo_sel = IDX_TO_PERIOD.get(periodo_idx, PERIODOS[-1])
+        periodo_display = f"Periodo {periodo_sel}"
+        subset_key, agri_def = resolve_subset(filtros, agri_def_label)
+        if nivel == "NAT":
+            df_map = build_national_layer(periodo_sel, subset_key, agri_def, indicador_col, country_filter=pais_filter)
+        else:
+            df_map = _regional_slice(periodo_sel, subset_key, agri_def, indicador_col, country_filter=pais_filter)
+        subpop_txt = _subset_ui_text(subset_key, agri_def)
+
     feature_ids = _feature_ids_for_scope(df_map, escala, pais_iso3)
 
     if df_map is None or df_map.empty:
@@ -1194,36 +1522,31 @@ def update_map(indicador_label, periodo_idx, filtros, agri_def_label, nivel, esc
             "country_name": pd.Series([None] * len(feature_ids), dtype="string"),
             "region_name": pd.Series([None] * len(feature_ids), dtype="string"),
             "value_pct": np.nan,
-            "se_pp": np.nan, "ci95_lo": np.nan, "ci95_hi": np.nan, "sample_n": np.nan,
+            "se_pp": np.nan,
+            "ci95_lo": np.nan,
+            "ci95_hi": np.nan,
+            "sample_n": np.nan,
         })
     else:
         df_map = df_map.set_index("feature_id").reindex(feature_ids).reset_index()
 
-    # Fill names that came from reindexing
     df_map = _fill_names_from_geojson(df_map)
 
-    # ---- Missing / colored split
     value_num = pd.to_numeric(df_map["value_pct"], errors="coerce")
     missing_mask = ~np.isfinite(value_num)
     missing_ids = df_map.loc[missing_mask, "feature_id"].astype(str).tolist()
-
-    # Only keep rows with data for the colored layer (prevents bad hover)
     df_color = df_map.loc[~missing_mask].copy()
 
-    # ---- Color scale bounds (based on available data)
     if df_color.empty:
-        # No colored data at all for this selection – fall back to sensible bounds
-        zmin, zmax = 0.0, 1.0
+        zmin, zmax = (0.0, 1.0)
     else:
         zmin, zmax = _robust_min_max(df_color["value_pct"])
 
-    # ---- Center/zoom
     if escala == "PAIS" and pais_iso3 and pais_iso3 in COUNTRY_BBOX:
         center, zoom = _center_zoom_from_bbox(*COUNTRY_BBOX[pais_iso3])
     else:
         center, zoom = _bbox_from_features(feature_ids)
 
-    # Preserve user pan/zoom (Mapbox / MapLibre / generic)
     if relayout_data and "mapbox.center" in relayout_data:
         zoom = relayout_data.get("mapbox.zoom", zoom)
         center = relayout_data.get("mapbox.center", center)
@@ -1234,85 +1557,61 @@ def update_map(indicador_label, periodo_idx, filtros, agri_def_label, nivel, esc
         zoom = relayout_data.get("map.zoom", zoom)
         center = relayout_data.get("map.center", center)
 
-    # ---- Hover/customdata (ONLY for colored layer)
+    nivel_txt = "Nacional" if nivel == "NAT" else "Regional"
+    scope_title = COUNTRY_NAME_BY_CODE.get(pais_iso3, "América Latina") if escala == "PAIS" and pais_iso3 else "América Latina"
+    map_title = f"{indicador_label} · {nivel_txt} · {scope_title} · {periodo_display or ''}".strip()
+    if map_title.endswith('·'):
+        map_title = map_title[:-1].strip()
+    if (not is_climate) and subpop_txt:
+        map_title += f" · Subpoblación: {subpop_txt}"
+
     if df_color.empty:
-        # Build figure (no colored layer data) + grey layer underneath
-        fig = _make_choropleth(
-            df_color, zmin, zmax, center, zoom, indicador_label,
-            missing_ids=missing_ids
-        )
-        # Title & layout
-        nivel_txt = "Nacional" if nivel == "NAT" else "Regional"
-        scope_title = COUNTRY_NAME_BY_CODE.get(pais_iso3, "América Latina") if (escala == "PAIS" and pais_iso3) else "América Latina"
-        map_title = f"{indicador_label} · {nivel_txt} · {scope_title} · Periodo {periodo_sel}"
-        subpop_txt = _subset_ui_text(subset_key, agri_def)
-        if subpop_txt:
-            map_title += f" · Subpoblación: {subpop_txt}"
-        fig.update_layout(
-            margin=dict(l=0, r=0, t=0, b=0),
-            coloraxis_colorbar=dict(title="%"),
-            uirevision="keep",
-        )
+        fig = _make_choropleth(df_color, zmin, zmax, center, zoom, indicador_label, missing_ids=missing_ids)
+        fig.update_layout(margin=dict(l=0, r=0, t=0, b=0), coloraxis_colorbar=dict(title=colorbar_title), uirevision="keep")
         return fig, map_title, ""
 
-    # Colored layer values
-    z = (
-        df_color["value_pct"]
-        .astype("float32").round(1)
-        .astype("float16").astype(float)
-        .tolist()
-    )
+    if is_climate:
+        z = df_color["value_pct"].astype("float32").round(2).astype(float).tolist()
+        custom_stack = np.stack([
+            df_color["country_name"].astype(str).values,
+            df_color["region_name"].astype(str).values,
+        ], axis=-1)
+        customdata = custom_stack.tolist()
+        hover_suffix = CLIMATE_HOVER_SUFFIX.get(clima_value, "valor")
+        hovertemplate = (
+            "<b>%{customdata[0]}</b> – %{customdata[1]}<br>"
+            f"{indicador_label}: " + f"%{{z:.2f}} {hover_suffix}<extra></extra>"
+        )
+    else:
+        z = df_color["value_pct"].astype("float32").round(1).astype(float).tolist()
+        custom_stack = np.stack([
+            df_color["country_name"].astype(str).values,
+            df_color["region_name"].astype(str).values,
+            df_color["ci95_lo"].astype("float32").round(1).astype(float).values,
+            df_color["ci95_hi"].astype("float32").round(1).astype(float).values,
+            df_color["se_pp"].astype("float32").round(1).astype(float).values,
+            df_color["sample_n"].astype("float32").round(0).astype(float).values,
+        ], axis=-1)
+        customdata = custom_stack.tolist()
+        hover_lines = ["<b>%{customdata[0]}</b> – %{customdata[1]}<br>"]
+        if subpop_txt:
+            hover_lines.append(f"<i>Subpoblación: {subpop_txt}</i><br>")
+        hover_lines += [
+            f"{indicador_label}: " + "%{z:.1f}%<br>",
+            "IC95%: [%{customdata[2]:.1f} – %{customdata[3]:.1f}]<br>",
+            "EE: %{customdata[4]:.1f} p.p.<br>",
+            "n: %{customdata[5]:,.0f}",
+        ]
+        hovertemplate = "".join(hover_lines) + "<extra></extra>"
 
-    custom_stack = np.stack([
-        df_color["country_name"].astype(str).values,
-        df_color["region_name"].astype(str).values,
-        df_color["ci95_lo"].astype("float32").round(1).astype("float16").astype(float).values,
-        df_color["ci95_hi"].astype("float32").round(1).astype("float16").astype(float).values,
-        df_color["se_pp"].astype("float32").round(1).astype("float16").astype(float).values,
-        df_color["sample_n"].astype("float32").round(0).astype("float16").astype(float).values,
-    ], axis=-1)
-    customdata = custom_stack.tolist()
-
-    subpop_txt = _subset_ui_text(subset_key, agri_def)
-    hover_lines = ["<b>%{customdata[0]}</b> – %{customdata[1]}<br>"]
-    if subpop_txt:
-        hover_lines.append(f"<i>Subpoblación: {subpop_txt}</i><br>")
-    hover_lines += [
-        f"{indicador_label}: " + "%{z:.1f}%<br>",
-        "IC95%: [%{customdata[2]:.1f} – %{customdata[3]:.1f}]<br>",
-        "EE: %{customdata[4]:.1f} p.p.<br>",
-        "n: %{customdata[5]:,.0f}",
-    ]
-    hovertemplate = "".join(hover_lines) + "<extra></extra>"
-
-    # ---- Build figure: colored layer from df_color + grey layer from missing_ids
-    fig = _make_choropleth(
-        df_color, zmin, zmax, center, zoom, indicador_label,
-        missing_ids=missing_ids
-    )
-
-    # Apply hover + customdata to the colored trace(s) only
-    # Apply hover + customdata ONLY to the colored trace(s) (skip the grey layer)
+    fig = _make_choropleth(df_color, zmin, zmax, center, zoom, indicador_label, missing_ids=missing_ids)
     for tr in fig.data:
-        # grey layer we added has hoverinfo="skip"
         if getattr(tr, "hoverinfo", None) != "skip":
             tr.hovertemplate = hovertemplate
             tr.customdata = customdata
             tr.z = z
 
-
-    # ---- Title & layout
-    nivel_txt = "Nacional" if nivel == "NAT" else "Regional"
-    scope_title = COUNTRY_NAME_BY_CODE.get(pais_iso3, "América Latina") if (escala == "PAIS" and pais_iso3) else "América Latina"
-    map_title = f"{indicador_label} · {nivel_txt} · {scope_title} · Periodo {periodo_sel}"
-    if subpop_txt:
-        map_title += f" · Subpoblación: {subpop_txt}"
-
-    fig.update_layout(
-        margin=dict(l=0, r=0, t=0, b=0),
-        coloraxis_colorbar=dict(title="%"),
-        uirevision="keep",
-    )
+    fig.update_layout(margin=dict(l=0, r=0, t=0, b=0), coloraxis_colorbar=dict(title=colorbar_title), uirevision="keep")
     return fig, map_title, ""
 
 
