@@ -1133,19 +1133,30 @@ app.layout = html.Div(
     style={"padding": "10px"},
     children=[
         html.Div(
-            className="brand-header",
-            children=[
-                html.A(
-                    href="https://rimisp.org",
-                    target="_blank",
-                    children=html.Img(
-                        src="https://rimisp.org/wp-content/uploads/2023/03/logo-rimisp-blanco.png",
-                        alt="Rimisp — Centro Latinoamericano para el Desarrollo Rural"
-                    ),
-                ),
-                html.Span("Rimisp — Centro Latinoamericano para el Desarrollo Rural", className="app-name")
-            ],
+    className="brand-header",
+    children=[
+        html.A(
+            href="https://rimisp.org",
+            target="_blank",
+            children=html.Img(
+                src="https://rimisp.org/wp-content/uploads/2023/03/logo-rimisp-blanco.png",
+                alt="Rimisp — Centro Latinoamericano para el Desarrollo Rural"
+            ),
         ),
+        html.Div(
+            children=[
+                html.Div(
+                    "Rimisp — Centro Latinoamericano para el Desarrollo Rural",
+                    className="app-name",
+                ),
+                html.Div(
+                    "Mapa interactivo creado por Andrés Fuica, contacto: andresfuba@gmail.com",
+                    style={"color": "rgba(255,255,255,0.9)", "fontSize": "12px", "marginTop": "2px"},
+                ),
+            ]
+        ),
+    ],
+),
 
         html.Div(
             className="hero",
@@ -1307,6 +1318,8 @@ app.layout = html.Div(
                                 ),
                             ],
                         ),
+
+                        
                         # --- Map figure ---
                         dcc.Graph(
                             id="mapa",
@@ -1625,5 +1638,6 @@ if __name__ == "__main__":
     debug_flag = os.getenv("DASH_DEBUG", "1") == "1"
     print(f"→ Open http://localhost:{port}")
     app.run(host=host, port=port, debug=debug_flag)
+
 
 
