@@ -101,7 +101,7 @@ def download_if_needed(url: str, dest: Path, timeout: int = 180, chunk: int = 1 
     if dest.exists() and dest.stat().st_size > 0:
         return dest
     tmp = dest.with_suffix(dest.suffix + ".tmp")
-    print(f"↓ Downloading {url} → {dest.name}")
+    print(f"[download] {url} -> {dest.name}")
     with requests.get(url, stream=True, timeout=timeout) as r:
         r.raise_for_status()
         with open(tmp, "wb") as f:
@@ -116,7 +116,7 @@ def maybe_download_and_unzip_dataset(zip_url: str, out_dir: Path) -> None:
     if out_dir.exists() and any(out_dir.rglob("*.parquet")):
         return
     out_dir.mkdir(parents=True, exist_ok=True)
-    print(f"↓ Downloading dataset ZIP from {zip_url}")
+    print(f"[download] dataset ZIP from {zip_url}")
     with requests.get(zip_url, stream=True, timeout=600) as r:
         r.raise_for_status()
         buf = io.BytesIO()
@@ -139,7 +139,7 @@ def maybe_download_and_unzip_dataset(zip_url: str, out_dir: Path) -> None:
                     dst.write(src.read())
         else:
             zf.extractall(out_dir)
-    print(f"✓ Unzipped dataset into {out_dir}")
+    print(f"[ok] Unzipped dataset into {out_dir}")
 
 def discover_dataset_dir(base_dir: Path) -> Optional[Path]:
     """Find a dataset directory matching your pre-process naming:
@@ -153,7 +153,7 @@ def discover_dataset_dir(base_dir: Path) -> Optional[Path]:
         if not p.is_absolute():
             p = base_dir / p
         if p.exists() and any(p.rglob("*.parquet")):
-            print(f"✓ Using dataset from DATASET_DIR={p}")
+            print(f"[ok] Using dataset from DATASET_DIR={p}")
             return p
 
     # 2) Exact name in base dir
@@ -175,7 +175,7 @@ def discover_dataset_dir(base_dir: Path) -> Optional[Path]:
     if candidates:
         candidates.sort(reverse=True)  # most files, then newest
         best = candidates[0][2]
-        print(f"✓ Using discovered dataset dir: {best}")
+        print(f"[ok] Using discovered dataset dir: {best}")
         return best
 
     return None
@@ -186,13 +186,13 @@ if DATASET_ZIP_URL:
     try:
         maybe_download_and_unzip_dataset(DATASET_ZIP_URL, dataset_dir)
     except Exception as e:
-        print(f"⚠ Failed to download/unzip dataset ZIP: {e}")
+        print(f"[warn] Failed to download/unzip dataset ZIP: {e}")
 
 # Always ensure GeoJSON exists (small)
 try:
     download_if_needed(GEOJSON_URL, GEOJSON_PATH)
 except Exception as e:
-    print(f"⚠ GeoJSON download failed: {e}")
+    print(f"[warn] GeoJSON download failed: {e}")
 
 # If neither dataset nor parquet exists, try to fetch parquet
 DISCOVERED_DATASET_DIR = discover_dataset_dir(BASE_DIR)
@@ -200,7 +200,7 @@ if DISCOVERED_DATASET_DIR is None and not (BASE_DIR / PANEL_FILE).exists():
     try:
         download_if_needed(PANEL_URL, PANEL_PATH)
     except Exception as e:
-        print(f"⚠ Parquet download failed: {e}")
+        print(f"[warn] Parquet download failed: {e}")
 
 # =============================================================================
 # 2) LOAD GEOJSON & PRECOMPUTE BBOX
@@ -345,7 +345,7 @@ def _weighted_average(values: pd.Series, weights: pd.Series) -> float:
 
 if USE_DATASET:
     DS = ds.dataset(str(DISCOVERED_DATASET_DIR), format="parquet", partitioning="hive")
-    print(f"ℹ Using partitioned dataset at {DISCOVERED_DATASET_DIR}")
+    print(f"[info] Using partitioned dataset at {DISCOVERED_DATASET_DIR}")
 
     def _scan(cols: List[str], filt=None) -> pd.DataFrame:
         sc = DS.scanner(columns=cols, filter=filt)
@@ -368,7 +368,7 @@ if USE_DATASET:
     def _periods() -> List[str]:
         df = _scan(["periodo"])
         cats = sorted(df["periodo"].dropna().astype(str).unique().tolist())
-        pref = ["2015-2016","2017-2018","2019","2020-2021","2022-2023"]
+        pref = ["2015/16","2017/18","2019","2020/21","2022/23"]
         return [p for p in pref if p in cats] + [p for p in cats if p not in pref]
 
     PERIODOS = _periods()
@@ -534,7 +534,7 @@ if USE_DATASET:
 
 else:
     # -------------------- Monolithic fallback --------------------
-    print("ℹ Using monolithic Parquet (no dataset dir found).")
+    print("[info] Using monolithic Parquet (no dataset dir found).")
     if not PANEL_PATH.exists():
         raise FileNotFoundError(f"Missing {PANEL_PATH}. Provide DATASET_ZIP_URL or PANEL_URL or commit the file.")
     panel = pd.read_parquet(PANEL_PATH)
@@ -550,7 +550,7 @@ else:
     INDICATOR_OPTIONS = [{"label": lbl, "value": lbl} for lbl in ind_map["indicator_label"].tolist()]
     INDICATOR_TO_COL = dict(zip(ind_map["indicator_label"], ind_map["indicator_col"]))
 
-    if pd.api.types.is_categorical_dtype(panel["periodo"]) and panel["periodo"].cat.ordered:
+    if isinstance(panel["periodo"].dtype, pd.CategoricalDtype) and panel["periodo"].cat.ordered:
         PERIODOS = panel["periodo"].cat.categories.tolist()
     else:
         PERIODOS = sorted(panel["periodo"].astype(str).unique().tolist())
@@ -925,9 +925,11 @@ app.index_string = """
         --panel-bg:#fff;
         --panel-header:#ecf3f1;
 
-        /* Layout knobs (so you can tweak easily) */
-        --page-side-margins: 8cm;   /* ≈4 cm on each side */
-        --page-max: 1600px;         /* maximum working width */
+        /* Layout knobs */
+        --page-gutter: clamp(18px, 2.4vw, 36px);
+        --page-max: 1880px;
+        --sidebar-width: clamp(320px, 23vw, 380px);
+        --map-min-height: clamp(620px, 78vh, 920px);
     }
 
     html, body { height: 100%; }
@@ -951,55 +953,87 @@ app.index_string = """
         color:#fff; font-weight:700; font-size:16px; letter-spacing:.2px; opacity:.95;
     }
 
-    /* Hero/title: same narrow width as map + extra breathing room */
+    /* Hero/title */
     .hero{
-        width: clamp(320px, calc(100vw - var(--page-side-margins)), var(--page-max));
-        margin: 32px auto 28px; padding: 18px 0;
+        width: min(calc(100vw - (var(--page-gutter) * 2)), var(--page-max));
+        margin: 28px auto 20px;
+        padding: 22px 0 8px;
     }
     .hero h1{
         text-align:center; color:var(--brand-deep);
-        margin:8px 0 10px; font-size:30px; line-height:1.15;
+        margin:8px 0 10px; font-size:clamp(32px, 3.2vw, 56px); line-height:1.08;
     }
-    .hero p { text-align:center; margin:4px 0; font-size:16px; line-height:1.35;}
+    .hero p { text-align:center; margin:4px 0; font-size:clamp(17px, 1.35vw, 20px); line-height:1.35;}
 
-    /* The rounded “outer box” now matches the map’s narrow width */
+    /* Main map card */
     .section-card{
         background:var(--card);
         border:1px solid var(--border);
-        border-radius:16px;
-        padding:12px 12px;
+        border-radius:24px;
+        padding:16px;
         box-shadow:var(--shadow);
         margin:12px auto;
-        width: clamp(320px, calc(100vw - var(--page-side-margins)), var(--page-max));
-        overflow: visible; /* so floating panel/menus can extend */
-    }
-
-    /* Map area: narrower, centered (≈4 cm per side), full height */
-    #map-container {
-        position: relative;
-        height: calc(100vh - 150px);
-        width: clamp(320px, calc(100vw - var(--page-side-margins)), var(--page-max));
-        margin: 0 auto;               /* center in the page */
+        width: min(calc(100vw - (var(--page-gutter) * 2)), var(--page-max));
         overflow: visible;
     }
 
-    /* Floating “Controles” panel — rounded & animated */
+    /* Desktop-first map shell */
+    #map-container {
+        width: 100%;
+        overflow: visible;
+    }
+    .dashboard-shell{
+        display:grid;
+        grid-template-columns: var(--sidebar-width) minmax(0, 1fr);
+        gap:20px;
+        align-items:start;
+        min-height:var(--map-min-height);
+    }
+    .map-sidebar{
+        position:sticky;
+        top:18px;
+        z-index:30;
+    }
+    .map-stage{
+        min-width:0;
+        display:flex;
+        flex-direction:column;
+        gap:12px;
+    }
+    .map-visual{
+        position:relative;
+        height:var(--map-min-height);
+        min-height:var(--map-min-height);
+        border-radius:22px;
+        overflow:hidden;
+        background:#d4dbdf;
+        border:1px solid rgba(89,142,125,.14);
+    }
+
+    /* Controls panel */
     .floating-controls{
-        position:absolute; top:16px; left:8px; width:320px;  /* narrower than before */
+        position:sticky;
+        top:18px;
+        width:100%;
         background:var(--panel-bg);
         border:1px solid var(--border);
-        border-radius:14px; box-shadow:var(--shadow);
+        border-radius:18px; box-shadow:var(--shadow);
         overflow:visible !important; z-index:2000;
-        transition: width .28s ease, transform .25s ease, box-shadow .25s ease;
-        will-change: width, transform;
+        transition: transform .25s ease, box-shadow .25s ease;
     }
-    .floating-controls.icon-only{ width:46px; overflow:hidden !important; }
+    .floating-controls.icon-only{ overflow:hidden !important; }
+    .floating-controls.icon-only .control-panel-header{
+        justify-content:center;
+        padding:12px;
+    }
+    .floating-controls.icon-only .header-text{ display:none; }
+    .floating-controls.icon-only .header-icon{ margin-right:0; }
+    .floating-controls.icon-only .toggle-btn{ margin-left:0; transform: rotate(180deg); }
 
-    /* Rounded header + nicer toggle */
     .control-panel-header{
         display:flex; align-items:center; gap:10px; padding:12px 14px;
         background:var(--panel-header); border-bottom:1px solid var(--border);
-        cursor:pointer; border-top-left-radius:14px; border-top-right-radius:14px;
+        cursor:pointer; border-top-left-radius:18px; border-top-right-radius:18px;
     }
     .control-panel-header .header-icon{font-size:18px;}
     .control-panel-header .header-text{font-weight:700;color:var(--brand-deep);font-size:15px;}
@@ -1008,14 +1042,12 @@ app.index_string = """
         color:var(--brand-deep); border-radius:999px; width:28px; height:28px; line-height:26px;
         font-size:14px; padding:0; cursor:pointer; transition: transform .25s ease, background .2s ease;
     }
-    .floating-controls.icon-only .toggle-btn{ transform: rotate(180deg); }
 
-    /* Animated open/close for the content (no “display:none”; smooth collapse) */
     .controls-content{
-        padding:14px; max-height:74vh; overflow-y:auto;
+        padding:16px 16px 20px; max-height:calc(100vh - 180px); overflow-y:auto;
         transition: max-height .3s ease, opacity .25s ease, padding .2s ease;
         opacity:1;
-        border-bottom-left-radius:14px; border-bottom-right-radius:14px;
+        border-bottom-left-radius:18px; border-bottom-right-radius:18px;
     }
     .controls-content.hidden{
         max-height:0; opacity:0; padding-top:0; padding-bottom:0; overflow:hidden;
@@ -1024,78 +1056,53 @@ app.index_string = """
     .controls-content > div { margin-bottom: 16px; }
     .controls-content label { display:block; font-weight:700; font-size:14px; margin-bottom:6px; }
 
-    /* Dropdown look & feel: rounded, and menus can extend beyond the panel */
     .lifted-dropdown .Select-control,
     .lifted-dropdown .Select__control{
         border-radius:10px !important;
         border-color: var(--border) !important;
         box-shadow:none !important;
     }
-    /* Menus: raise z-index and allow them to be wider than the panel */
     .lifted-dropdown .Select-menu-outer,
     .lifted-dropdown .Select__menu{
         z-index:4000 !important;
-        min-width: 360px;
-        width: max(360px, calc(100% + 240px));   /* extend beyond panel when needed */
-        max-width: min(620px, 90vw);
+        min-width: 100%;
+        width: 100%;
+        max-width: 100%;
         box-shadow: 0 12px 24px rgba(0,0,0,.16);
         border-radius: 10px;
     }
     .lifted-dropdown .Select-option,
     .lifted-dropdown .Select__option{
-        padding: 16px 20px !important;
-        line-height: 1.65 !important;
-        margin: 6px 4px !important;
+        padding: 14px 16px !important;
+        line-height: 1.55 !important;
+        margin: 4px 4px !important;
         white-space: normal !important;
         word-break: normal !important;
         border-radius: 8px !important;
     }
-    .lifted-dropdown .Select-menu { max-height: 50vh; } /* comfortable scrolling */
+    .lifted-dropdown .Select-menu { max-height: 50vh; }
 
-    /* Title chip on the map */
+    /* Title row above the map canvas */
     .title-wrap{
-        position:absolute; top:14px; left:50%; transform:translateX(-50%);
-        z-index:1200; text-align:center; pointer-events:none;
+        display:flex;
+        align-items:center;
+        justify-content:space-between;
+        gap:10px;
+        margin:0 4px;
     }
     .title-chip{
-        background:rgba(255,255,255,.95); padding:8px 20px; border-radius:20px;
-        font-size:14px; font-weight:700; color:var(--brand-deep);
+        flex:1 1 auto;
+        background:rgba(255,255,255,.95); padding:12px 18px; border-radius:18px;
+        font-size:clamp(16px, 1.2vw, 21px); font-weight:700; color:var(--brand-deep);
+        line-height:1.3;
         box-shadow:0 2px 8px rgba(0,0,0,.12);
         border:1px solid rgba(89,142,125,.25);
-        display:inline-block;
+        display:block;
     }
-    .title-spinner{ margin-top: 10px; }
+    .title-spinner{ margin-top: 0; flex:0 0 auto; }
     .title-spinner .dash-spinner{ transform:scale(.8); opacity:.85; }
 
-    @media (max-width:900px){
-        .floating-controls{ top:56px; left:6px; width:86vw; }
-        .floating-controls.icon-only{ width:44px; }
-    }
-    /* leave extra bottom room so controls never overlap */
-    .controls-content{ padding-bottom: 280px; }
-    /* --- Menus for AGRÍCOLA and PAÍS: open just below, can overflow panel --- */
-    #dd-agri-def, #dd-pais { position: relative; } /* anchor point */
-
-    #dd-agri-def .Select-menu-outer, #dd-pais .Select-menu-outer,
-    #dd-agri-def .Select__menu,      #dd-pais .Select__menu{
-    position: absolute !important;    /* keep them attached to the input */
-    left: 0 !important;
-    top: calc(100% + 6px) !important; /* just below the control */
-    z-index: 5000 !important;         /* above the map */
-    min-width: 260px;
-    width: max(100%, 420px);          /* a bit wider than the input */
-    max-width: min(80vw, 560px);
-    max-height: 56vh;                 /* don’t run off-screen */
-    overflow-y: auto;
-    border-radius: 10px;
-    box-shadow: 0 12px 24px rgba(0,0,0,.16);
-    }
-
-    /* Ensure nothing clips those menus */
     .section-card, #map-container, .floating-controls, .controls-content { overflow: visible !important; }
-
-    /* End the panel shortly after the PAÍS dropdown (no giant blank tail) */
-    .controls-content{ padding-bottom: 24px; }
 
     /* --- Replace the default map attribution with our own footer (see layout edit) --- */
     /* Hide the built-in overlays (MapboxGL or MapLibreGL) inside the map container */
@@ -1114,6 +1121,35 @@ app.index_string = """
     }
     */
 
+    @media (max-width:1100px){
+        .dashboard-shell{
+            grid-template-columns: 1fr;
+        }
+        .map-sidebar,
+        .floating-controls{
+            position:relative;
+            top:auto;
+        }
+        .map-visual{
+            height:70vh;
+            min-height:70vh;
+        }
+    }
+
+    @media (max-width:720px){
+        .section-card{ padding:12px; border-radius:18px; }
+        .hero{ margin: 18px auto 14px; }
+        .title-wrap{
+            flex-direction:column;
+            align-items:stretch;
+        }
+        .map-visual{
+            height:62vh;
+            min-height:62vh;
+            border-radius:18px;
+        }
+    }
+
     </style>
 
 
@@ -1130,34 +1166,33 @@ app.index_string = """
 """
 
 app.layout = html.Div(
-    style={"padding": "10px"},
+    style={"padding": "0 0 20px"},
     children=[
         html.Div(
-              className="brand-header",
-              children=[
-                  html.A(
-                      href="https://rimisp.org",
-                      target="_blank",
-                      children=html.Img(
-                          src="https://rimisp.org/wp-content/uploads/2023/03/logo-rimisp-blanco.png",
-                          alt="Rimisp — Centro Latinoamericano para el Desarrollo Rural"
-                      ),
-                  ),
-                  html.Div(
-                      children=[
-                          html.Div(
-                              "Rimisp — Centro Latinoamericano para el Desarrollo Rural",
-                              className="app-name",
-                          ),
-                          html.Div(
-                              "Mapa interactivo creado por Andrés Fuica, contacto: andresfuba@gmail.com",
-                              style={"color": "rgba(255,255,255,0.9)", "fontSize": "12px", "marginTop": "2px"},
-                          ),
-                      ]
-                  ),
-              ],
-          ),
-
+            className="brand-header",
+            children=[
+                html.A(
+                    href="https://rimisp.org",
+                    target="_blank",
+                    children=html.Img(
+                        src="https://rimisp.org/wp-content/uploads/2023/03/logo-rimisp-blanco.png",
+                        alt="Rimisp — Centro Latinoamericano para el Desarrollo Rural"
+                    ),
+                ),
+                html.Div(
+                    children=[
+                        html.Div(
+                            "Rimisp — Centro Latinoamericano para el Desarrollo Rural",
+                            className="app-name",
+                        ),
+                        html.Div(
+                            "Mapa interactivo creado por Andrés Fuica, contacto: andresfuba@gmail.com",
+                            style={"color": "rgba(255,255,255,0.9)", "fontSize": "12px", "marginTop": "2px"},
+                        ),
+                    ]
+                ),
+            ],
+        ),
         html.Div(
             className="hero",
             children=[
@@ -1171,187 +1206,194 @@ app.layout = html.Div(
             children=[
                 html.Div(
                     id="map-container",
-                    style={
-                        "position": "relative",
-                        "width": "clamp(320px, calc(100vw - 8cm), 1600px)",  # ~4 cm per side, responsive
-                        "margin": "0 auto",                                  # center
-                        "overflow": "visible"
-                    },
-
                     children=[
                         html.Div(
-                            id={"type": "floating-panel-wrapper", "index": "map"},
-                            className="floating-controls",
+                            className="dashboard-shell",
                             children=[
                                 html.Div(
-                                    id={"type": "panel-header", "index": "map"},
-                                    className="control-panel-header",
-                                    n_clicks=0,
+                                    className="map-sidebar",
                                     children=[
-                                        html.Span("⚙️", className="header-icon"),
-                                        html.Span("Controles", className="header-text"),
-                                        html.Button("−", id="toggle-controls-btn", className="toggle-btn"),
+                                        html.Div(
+                                            id={"type": "floating-panel-wrapper", "index": "map"},
+                                            className="floating-controls",
+                                            children=[
+                                                html.Div(
+                                                    id={"type": "panel-header", "index": "map"},
+                                                    className="control-panel-header",
+                                                    n_clicks=0,
+                                                    children=[
+                                                        html.Span("⚙️", className="header-icon"),
+                                                        html.Span("Controles", className="header-text"),
+                                                        html.Button("−", id="toggle-controls-btn", className="toggle-btn"),
+                                                    ],
+                                                ),
+                                                html.Div(
+                                                    id={"type": "panel-content", "index": "map"},
+                                                    className="controls-content",
+                                                    children=[
+                                                        html.Div([
+                                                            html.Label("Tipo de indicador"),
+                                                            dcc.RadioItems(
+                                                                id="radio-variable-mode",
+                                                                options=[
+                                                                    {"label": " Pobreza", "value": "POBREZA"},
+                                                                    {"label": " Choques climaticos", "value": "CLIMA"},
+                                                                ],
+                                                                value="POBREZA",
+                                                                inline=True,
+                                                            ),
+                                                        ]),
+                                                        html.Div(
+                                                            id="selector-pobreza",
+                                                            children=[
+                                                                html.Label("Variable de pobreza"),
+                                                                dcc.Dropdown(
+                                                                    id="dd-indicador",
+                                                                    className="lifted-dropdown",
+                                                                    options=INDICATOR_OPTIONS,
+                                                                    value=INDICATOR_OPTIONS[0]["value"] if INDICATOR_OPTIONS else None,
+                                                                    clearable=False,
+                                                                ),
+                                                            ],
+                                                        ),
+                                                        html.Div(
+                                                            id="selector-clima",
+                                                            style={"display": "none"},
+                                                            children=[
+                                                                html.Label("Choque climatico"),
+                                                                dcc.Dropdown(
+                                                                    id="dd-clima",
+                                                                    className="lifted-dropdown",
+                                                                    options=CLIMATE_OPTIONS,
+                                                                    value=CLIMATE_OPTIONS[0]["value"] if CLIMATE_OPTIONS else None,
+                                                                    clearable=False,
+                                                                ),
+                                                            ],
+                                                        ),
+                                                        html.Div([
+                                                            html.Label("📅 Periodo"),
+                                                            dcc.Slider(
+                                                                id="sl-periodo",
+                                                                min=1, max=len(PERIODOS), step=None,
+                                                                value=len(PERIODOS),
+                                                                marks=_period_marks(),
+                                                                included=False,
+                                                                updatemode="mouseup",
+                                                            ),
+                                                        ]),
+                                                        html.Div([
+                                                            html.Label("🎯 Filtros de población"),
+                                                            dcc.Checklist(
+                                                                id="chk-filtros",
+                                                                options=[
+                                                                    {"label": " Rural", "value": "RURAL"},
+                                                                    {"label": " Indígena", "value": "INDIGENA"},
+                                                                    {"label": " Agrícola", "value": "AGRI"},
+                                                                ],
+                                                                value=[],
+                                                                labelStyle={"display": "block", "fontSize": "13px", "marginBottom": "8px"},
+                                                            ),
+                                                            dcc.Dropdown(
+                                                                id="dd-agri-def",
+                                                                className="lifted-dropdown",
+                                                                options=(AGRI_OPTIONS or []),
+                                                                value=(AGRI_OPTIONS[0]["value"] if AGRI_OPTIONS else None) if AGRI_OPTIONS else None,
+                                                                clearable=False,
+                                                                disabled=(len(AGRI_OPTIONS) == 0),
+                                                                placeholder="Definición de 'agrícola'",
+                                                            ),
+                                                        ]),
+                                                        html.Div([
+                                                            html.Label("🏷️ Nivel / Escala"),
+                                                            dcc.RadioItems(
+                                                                id="radio-nivel",
+                                                                options=[
+                                                                    {"label": " Regional", "value": "REG"},
+                                                                    {"label": " Nacional (color por país)", "value": "NAT"},
+                                                                ],
+                                                                value="REG",
+                                                                inline=True,
+                                                            ),
+                                                            html.Div(style={"height": "6px"}),
+                                                            dcc.RadioItems(
+                                                                id="radio-escala",
+                                                                options=[
+                                                                    {"label": " Continente", "value": "GLOBAL"},
+                                                                    {"label": " Por país", "value": "PAIS"},
+                                                                ],
+                                                                value="GLOBAL",
+                                                                inline=True,
+                                                            ),
+                                                            html.Div(style={"height": "6px"}),
+                                                            dcc.Dropdown(
+                                                                id="dd-pais",
+                                                                className="lifted-dropdown",
+                                                                options=COUNTRY_OPTIONS,
+                                                                value=None,
+                                                                placeholder="País (si 'Por país')",
+                                                                disabled=True,
+                                                            ),
+                                                        ]),
+                                                    ],
+                                                ),
+                                            ],
+                                        ),
                                     ],
                                 ),
                                 html.Div(
-                                    id={"type": "panel-content", "index": "map"},
-                                    className="controls-content",
+                                    className="map-stage",
                                     children=[
-                                        html.Div([
-                                            html.Label("Tipo de indicador"),
-                                            dcc.RadioItems(
-                                                id="radio-variable-mode",
-                                                options=[
-                                                    {"label": " Pobreza", "value": "POBREZA"},
-                                                    {"label": " Choques climaticos", "value": "CLIMA"},
-                                                ],
-                                                value="POBREZA",
-                                                inline=True,
-                                            ),
-                                        ]),
                                         html.Div(
-                                            id="selector-pobreza",
+                                            className="title-wrap",
                                             children=[
-                                                html.Label("Variable de pobreza"),
-                                                dcc.Dropdown(
-                                                    id="dd-indicador",
-                                                    className="lifted-dropdown",
-                                                    options=INDICATOR_OPTIONS,
-                                                    value=INDICATOR_OPTIONS[0]["value"] if INDICATOR_OPTIONS else None,
-                                                    clearable=False,
+                                                html.Div(id="map-title", className="title-chip"),
+                                                html.Div(
+                                                    className="title-spinner",
+                                                    children=dcc.Loading(
+                                                        id="map-loading",
+                                                        type="dot",
+                                                        children=html.Div(id="map-loading-sentinel", style={"width": 1, "height": 1}),
+                                                    ),
                                                 ),
                                             ],
                                         ),
                                         html.Div(
-                                            id="selector-clima",
-                                            style={"display": "none"},
+                                            className="map-visual",
                                             children=[
-                                                html.Label("Choque climatico"),
-                                                dcc.Dropdown(
-                                                    id="dd-clima",
-                                                    className="lifted-dropdown",
-                                                    options=CLIMATE_OPTIONS,
-                                                    value=CLIMATE_OPTIONS[0]["value"] if CLIMATE_OPTIONS else None,
-                                                    clearable=False,
+                                                dcc.Graph(
+                                                    id="mapa",
+                                                    style={"height": "100%", "width": "100%"},
+                                                    config=GRAPH_CONFIG,
                                                 ),
                                             ],
                                         ),
-                                        html.Div([
-                                            html.Label("📅 Periodo"),
-                                            dcc.Slider(
-                                                id="sl-periodo",
-                                                min=1, max=len(PERIODOS), step=None,
-                                                value=len(PERIODOS),
-                                                marks=_period_marks(),
-                                                included=False,
-                                                updatemode="mouseup",
-                                            ),
-                                        ]),
-                                        html.Div([
-                                            html.Label("🎯 Filtros de población"),
-                                            dcc.Checklist(
-                                                id="chk-filtros",
-                                                options=[
-                                                    {"label": " Rural", "value": "RURAL"},
-                                                    {"label": " Indígena", "value": "INDIGENA"},
-                                                    {"label": " Agrícola", "value": "AGRI"},
-                                                ],
-                                                value=[],
-                                                labelStyle={"display": "block", "fontSize": "13px", "marginBottom": "8px"},
-                                            ),
-                                            dcc.Dropdown(
-                                                id="dd-agri-def",
-                                                className="lifted-dropdown",
-                                                options=(AGRI_OPTIONS or []),
-                                                value=(AGRI_OPTIONS[0]["value"] if AGRI_OPTIONS else None) if AGRI_OPTIONS else None,
-                                                clearable=False,
-                                                disabled=(len(AGRI_OPTIONS) == 0),
-                                                placeholder="Definición de 'agrícola'",
-                                            ),
-                                        ]),
-                                        html.Div([
-                                            html.Label("🏷️ Nivel / Escala"),
-                                            dcc.RadioItems(
-                                                id="radio-nivel",
-                                                options=[
-                                                    {"label": " Regional", "value": "REG"},
-                                                    {"label": " Nacional (color por país)", "value": "NAT"},
-                                                ],
-                                                value="REG",
-                                                inline=True,
-                                            ),
-                                            html.Div(style={"height": "6px"}),
-                                            dcc.RadioItems(
-                                                id="radio-escala",
-                                                options=[
-                                                    {"label": " Continente", "value": "GLOBAL"},
-                                                    {"label": " Por país", "value": "PAIS"},
-                                                ],
-                                                value="GLOBAL",
-                                                inline=True,
-                                            ),
-                                            html.Div(style={"height": "6px"}),
-                                            dcc.Dropdown(
-                                                id="dd-pais",
-                                                className="lifted-dropdown",
-                                                options=COUNTRY_OPTIONS,
-                                                value=None,
-                                                placeholder="País (si 'Por país')",
-                                                disabled=True,
-                                            ),
-                                        ]),
+                                        html.Div(
+                                            id="map-attrib",
+                                            style={
+                                                "textAlign": "right",
+                                                "fontSize": "11px",
+                                                "color": "#6b7b75",
+                                                "padding": "0 10px 4px",
+                                            },
+                                            children=[
+                                                html.Span("Map data © "),
+                                                html.A(
+                                                    "OpenStreetMap contributors",
+                                                    href="https://www.openstreetmap.org/copyright",
+                                                    target="_blank",
+                                                ),
+                                                html.Span(" • Basemap © "),
+                                                html.A(
+                                                    "CARTO",
+                                                    href="https://carto.com/attributions",
+                                                    target="_blank",
+                                                ),
+                                            ],
+                                        ),
                                     ],
                                 ),
                             ],
                         ),
-                        html.Div(
-                            className="title-wrap",
-                            children=[
-                                html.Div(id="map-title", className="title-chip"),
-                                html.Div(
-                                    className="title-spinner",
-                                    children=dcc.Loading(
-                                        id="map-loading",
-                                        type="dot",
-                                        children=html.Div(id="map-loading-sentinel", style={"width": 1, "height": 1}),
-                                    ),
-                                ),
-                            ],
-                        ),
-
-                        
-                        # --- Map figure ---
-                        dcc.Graph(
-                            id="mapa",
-                            style={"height": "100%", "width": "100%"},
-                            config=GRAPH_CONFIG,
-                        ),
-
-                        # --- Attribution footer (license-compliant, off-map) ---
-                        html.Div(
-                            id="map-attrib",
-                            style={
-                                "textAlign": "right",
-                                "fontSize": "11px",
-                                "color": "#6b7b75",
-                                "padding": "6px 10px 2px",
-                            },
-                            children=[
-                                html.Span("Map data © "),
-                                html.A(
-                                    "OpenStreetMap contributors",
-                                    href="https://www.openstreetmap.org/copyright",
-                                    target="_blank",
-                                ),
-                                html.Span(" • Basemap © "),
-                                html.A(
-                                    "CARTO",
-                                    href="https://carto.com/attributions",
-                                    target="_blank",
-                                ),
-                            ],
-                        ),
-
                     ],
                 )
             ],
@@ -1636,9 +1678,8 @@ if __name__ == "__main__":
     host = "0.0.0.0" if is_render else "127.0.0.1"
     port = int(os.getenv("PORT", "8050"))
     debug_flag = os.getenv("DASH_DEBUG", "1") == "1"
-    print(f"→ Open http://localhost:{port}")
+    print(f"Open http://localhost:{port}")
     app.run(host=host, port=port, debug=debug_flag)
-
 
 
 
