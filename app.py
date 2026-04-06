@@ -368,7 +368,7 @@ if USE_DATASET:
     def _periods() -> List[str]:
         df = _scan(["periodo"])
         cats = sorted(df["periodo"].dropna().astype(str).unique().tolist())
-        pref = ["2015/16","2017/18","2019","2020/21","2022/23"]
+        pref = ["2015-2016","2017-2018","2019","2020-2021","2022-2023"]
         return [p for p in pref if p in cats] + [p for p in cats if p not in pref]
 
     PERIODOS = _periods()
@@ -900,7 +900,13 @@ GRAPH_CONFIG = {
 MAP_STYLE = os.getenv("MAP_STYLE", "carto-positron")
 
 def _period_marks():
-    return { (idx := PERIOD_TO_IDX[p]): p for p in PERIODOS }
+    short_labels = {
+        "2015-2016": "2015-16",
+        "2017-2018": "2017-18",
+        "2020-2021": "2020-21",
+        "2022-2023": "2022-23",
+    }
+    return {(idx := PERIOD_TO_IDX[p]): short_labels.get(p, p) for p in PERIODOS}
 
 app.index_string = """
 <!DOCTYPE html>
@@ -1055,6 +1061,24 @@ app.index_string = """
 
     .controls-content > div { margin-bottom: 16px; }
     .controls-content label { display:block; font-weight:700; font-size:14px; margin-bottom:6px; }
+    .period-slider-wrap .rc-slider{
+        margin: 6px 6px 30px 4px;
+    }
+    .period-slider-wrap .rc-slider-mark{
+        top: 20px;
+    }
+    .period-slider-wrap .rc-slider-mark-text{
+        width: 58px;
+        margin-left: -29px !important;
+        font-size: 11px;
+        line-height: 1.15;
+        white-space: nowrap;
+        color: #4d5b56;
+    }
+    .period-slider-wrap .rc-slider-mark-text-active{
+        font-weight: 700;
+        color: var(--brand-deep);
+    }
 
     .lifted-dropdown .Select-control,
     .lifted-dropdown .Select__control{
@@ -1147,6 +1171,11 @@ app.index_string = """
             height:62vh;
             min-height:62vh;
             border-radius:18px;
+        }
+        .period-slider-wrap .rc-slider-mark-text{
+            width: 50px;
+            margin-left: -25px !important;
+            font-size: 10px;
         }
     }
 
@@ -1270,7 +1299,7 @@ app.layout = html.Div(
                                                                 ),
                                                             ],
                                                         ),
-                                                        html.Div([
+                                                        html.Div(className="period-slider-wrap", children=[
                                                             html.Label("📅 Periodo"),
                                                             dcc.Slider(
                                                                 id="sl-periodo",
